@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -29,6 +33,91 @@ MOUSE_BUTTONS = {
     0: Button.left,
     1: Button.right,
     2: Button.middle,
+}
+
+
+HID_TO_SCANCODE = {
+    0x04: (0x1E, False),
+    0x05: (0x30, False),
+    0x06: (0x2E, False),
+    0x07: (0x20, False),
+    0x08: (0x12, False),
+    0x09: (0x21, False),
+    0x0A: (0x22, False),
+    0x0B: (0x23, False),
+    0x0C: (0x17, False),
+    0x0D: (0x24, False),
+    0x0E: (0x25, False),
+    0x0F: (0x26, False),
+    0x10: (0x32, False),
+    0x11: (0x31, False),
+    0x12: (0x18, False),
+    0x13: (0x19, False),
+    0x14: (0x10, False),
+    0x15: (0x13, False),
+    0x16: (0x1F, False),
+    0x17: (0x14, False),
+    0x18: (0x16, False),
+    0x19: (0x2F, False),
+    0x1A: (0x11, False),
+    0x1B: (0x2D, False),
+    0x1C: (0x15, False),
+    0x1D: (0x2C, False),
+    0x1E: (0x02, False),
+    0x1F: (0x03, False),
+    0x20: (0x04, False),
+    0x21: (0x05, False),
+    0x22: (0x06, False),
+    0x23: (0x07, False),
+    0x24: (0x08, False),
+    0x25: (0x09, False),
+    0x26: (0x0A, False),
+    0x27: (0x0B, False),
+    0x28: (0x1C, False),
+    0x29: (0x01, False),
+    0x2A: (0x0E, False),
+    0x2B: (0x0F, False),
+    0x2C: (0x39, False),
+    0x2D: (0x0C, False),
+    0x2E: (0x0D, False),
+    0x2F: (0x1A, False),
+    0x30: (0x1B, False),
+    0x31: (0x2B, False),
+    0x33: (0x27, False),
+    0x34: (0x28, False),
+    0x35: (0x29, False),
+    0x36: (0x33, False),
+    0x37: (0x34, False),
+    0x38: (0x35, False),
+    0x39: (0x3A, False),
+    0x3A: (0x3B, False),
+    0x3B: (0x3C, False),
+    0x3C: (0x3D, False),
+    0x3D: (0x3E, False),
+    0x3E: (0x3F, False),
+    0x3F: (0x40, False),
+    0x40: (0x41, False),
+    0x41: (0x42, False),
+    0x42: (0x43, False),
+    0x43: (0x44, False),
+    0x44: (0x57, False),
+    0x45: (0x58, False),
+    0x4C: (0x53, True),
+    0x4F: (0x4D, True),
+    0x50: (0x4B, True),
+    0x51: (0x50, True),
+    0x52: (0x48, True),
+}
+
+MODIFIER_SCANCODES = {
+    0: (0x1D, False),
+    1: (0x2A, False),
+    2: (0x38, False),
+    3: (0x5B, True),
+    4: (0x1D, True),
+    5: (0x36, False),
+    6: (0x38, True),
+    7: (0x5C, True),
 }
 
 
@@ -244,6 +333,209 @@ class InputBridge:
         self.mouse.release_all()
 
 
+WORD = ctypes.c_uint16
+DWORD = ctypes.c_uint32
+LONG = ctypes.c_int32
+UINT = ctypes.c_uint32
+ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", WORD),
+        ("wScan", WORD),
+        ("dwFlags", DWORD),
+        ("time", DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", LONG),
+        ("dy", LONG),
+        ("mouseData", DWORD),
+        ("dwFlags", DWORD),
+        ("time", DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", DWORD),
+        ("wParamL", WORD),
+        ("wParamH", WORD),
+    )
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = (
+        ("ki", KEYBDINPUT),
+        ("mi", MOUSEINPUT),
+        ("hi", HARDWAREINPUT),
+    )
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = (
+        ("type", DWORD),
+        ("union", INPUT_UNION),
+    )
+
+
+class Win32SendInput:
+    INPUT_MOUSE = 0
+    INPUT_KEYBOARD = 1
+
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_SCANCODE = 0x0008
+
+    MOUSEEVENTF_MOVE = 0x0001
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+    MOUSEEVENTF_MIDDLEDOWN = 0x0020
+    MOUSEEVENTF_MIDDLEUP = 0x0040
+    MOUSEEVENTF_WHEEL = 0x0800
+    WHEEL_DELTA = 120
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise RuntimeError("win32 input backend is only available on Windows")
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.user32.SendInput.argtypes = (UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+        self.user32.SendInput.restype = UINT
+
+    def key(self, scan_code: int, down: bool, extended: bool = False) -> None:
+        flags = self.KEYEVENTF_SCANCODE
+        if extended:
+            flags |= self.KEYEVENTF_EXTENDEDKEY
+        if not down:
+            flags |= self.KEYEVENTF_KEYUP
+        event = INPUT(
+            type=self.INPUT_KEYBOARD,
+            union=INPUT_UNION(ki=KEYBDINPUT(0, scan_code, flags, 0, 0)),
+        )
+        self._send(event)
+
+    def mouse(self, flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> None:
+        event = INPUT(
+            type=self.INPUT_MOUSE,
+            union=INPUT_UNION(mi=MOUSEINPUT(dx, dy, data & 0xFFFFFFFF, flags, 0, 0)),
+        )
+        self._send(event)
+
+    def _send(self, event: INPUT) -> None:
+        sent = self.user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event))
+        if sent != 1:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+class Win32KeyboardBridge:
+    def __init__(self, sender: Win32SendInput) -> None:
+        self.sender = sender
+        self.current: set[tuple[int, bool]] = set()
+        self.lock = threading.Lock()
+
+    def apply(self, state: KeyState) -> None:
+        target_modifiers = self._modifier_scancodes(state.modifiers)
+        target_keys = self._key_scancodes(state.keys)
+        target = target_modifiers | target_keys
+        with self.lock:
+            current_modifiers = self.current & set(MODIFIER_SCANCODES.values())
+            current_keys = self.current - set(MODIFIER_SCANCODES.values())
+
+            for scan_code, extended in current_keys - target_keys:
+                self.sender.key(scan_code, False, extended)
+            for scan_code, extended in current_modifiers - target_modifiers:
+                self.sender.key(scan_code, False, extended)
+            for scan_code, extended in target_modifiers - current_modifiers:
+                self.sender.key(scan_code, True, extended)
+            for scan_code, extended in target_keys - current_keys:
+                self.sender.key(scan_code, True, extended)
+            self.current = target
+
+    def release_all(self) -> None:
+        with self.lock:
+            current_modifiers = self.current & set(MODIFIER_SCANCODES.values())
+            current_keys = self.current - set(MODIFIER_SCANCODES.values())
+            for scan_code, extended in list(current_keys):
+                self.sender.key(scan_code, False, extended)
+            for scan_code, extended in list(current_modifiers):
+                self.sender.key(scan_code, False, extended)
+            self.current.clear()
+
+    @staticmethod
+    def _modifier_scancodes(modifiers: int) -> set[tuple[int, bool]]:
+        return {scan for bit, scan in MODIFIER_SCANCODES.items() if modifiers & (1 << bit)}
+
+    @staticmethod
+    def _key_scancodes(keys: tuple[int, ...]) -> set[tuple[int, bool]]:
+        return {HID_TO_SCANCODE[hid] for hid in keys if hid in HID_TO_SCANCODE}
+
+
+class Win32MouseBridge:
+    BUTTON_EVENTS = {
+        0: (Win32SendInput.MOUSEEVENTF_LEFTDOWN, Win32SendInput.MOUSEEVENTF_LEFTUP),
+        1: (Win32SendInput.MOUSEEVENTF_RIGHTDOWN, Win32SendInput.MOUSEEVENTF_RIGHTUP),
+        2: (Win32SendInput.MOUSEEVENTF_MIDDLEDOWN, Win32SendInput.MOUSEEVENTF_MIDDLEUP),
+    }
+
+    def __init__(self, sender: Win32SendInput, mode_active: threading.Event) -> None:
+        self.sender = sender
+        self.mode_active = mode_active
+        self.current_buttons: set[int] = set()
+        self.lock = threading.Lock()
+
+    def apply(self, state: MouseState) -> None:
+        if not state.active:
+            self.mode_active.clear()
+            self.release_all()
+            return
+
+        self.mode_active.set()
+        target_buttons = {bit for bit in self.BUTTON_EVENTS if state.buttons & (1 << bit)}
+        with self.lock:
+            for bit in self.current_buttons - target_buttons:
+                self.sender.mouse(self.BUTTON_EVENTS[bit][1])
+            for bit in target_buttons - self.current_buttons:
+                self.sender.mouse(self.BUTTON_EVENTS[bit][0])
+            self.current_buttons = target_buttons
+
+            if state.dx or state.dy:
+                self.sender.mouse(self.sender.MOUSEEVENTF_MOVE, dx=state.dx, dy=state.dy)
+            if state.wheel:
+                self.sender.mouse(self.sender.MOUSEEVENTF_WHEEL, data=state.wheel * self.sender.WHEEL_DELTA)
+
+    def release_all(self) -> None:
+        self.mode_active.clear()
+        with self.lock:
+            for bit in list(self.current_buttons):
+                self.sender.mouse(self.BUTTON_EVENTS[bit][1])
+            self.current_buttons.clear()
+
+
+class Win32InputBridge:
+    def __init__(self, mouse_mode_active: threading.Event) -> None:
+        sender = Win32SendInput()
+        self.keyboard = Win32KeyboardBridge(sender)
+        self.mouse = Win32MouseBridge(sender, mouse_mode_active)
+
+    def apply(self, state: KeyState | MouseState) -> None:
+        if isinstance(state, KeyState):
+            self.mouse.release_all()
+            self.keyboard.apply(state)
+        else:
+            self.mouse.apply(state)
+
+    def release_all(self) -> None:
+        self.keyboard.release_all()
+        self.mouse.release_all()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve Windows screen and keyboard control to a Cardputer-Adv.")
     parser.add_argument("--bind", default="0.0.0.0", help="IP/interface to listen on.")
@@ -255,7 +547,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monitor", type=int, default=1, help="mss monitor index. 1 is usually the primary display.")
     parser.add_argument("--quality-filter", choices=("nearest", "bilinear", "bicubic"), default="bilinear")
     parser.add_argument("--input-timeout", type=float, default=4.0, help="Seconds without input reports before reconnect.")
+    parser.add_argument("--input-backend", choices=("win32", "pynput"), default="win32")
+    parser.add_argument("--no-admin-relaunch", action="store_true", help="Do not relaunch through UAC on Windows.")
     return parser.parse_args()
+
+
+def is_admin() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except OSError:
+        return False
+
+
+def relaunch_as_admin() -> bool:
+    if os.name != "nt":
+        return False
+
+    if getattr(sys, "frozen", False):
+        executable = sys.executable
+        params = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        executable = sys.executable
+        params = subprocess.list2cmdline(sys.argv)
+
+    result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, os.getcwd(), 1)
+    return result > 32
+
+
+def ensure_admin(args: argparse.Namespace) -> None:
+    if os.name != "nt" or args.no_admin_relaunch or is_admin():
+        return
+    print("Administrator privileges are required for reliable game input. Requesting UAC elevation...")
+    if relaunch_as_admin():
+        raise SystemExit(0)
+    print("UAC elevation was cancelled or failed; continuing without administrator privileges.", flush=True)
 
 
 def recv_line(conn: socket.socket, limit: int = 120) -> str:
@@ -459,14 +786,22 @@ def input_server(args: argparse.Namespace, bridge: InputBridge, stop: threading.
                 conn.close()
 
 
+def create_input_bridge(args: argparse.Namespace, mouse_mode_active: threading.Event) -> InputBridge | Win32InputBridge:
+    if args.input_backend == "win32":
+        return Win32InputBridge(mouse_mode_active)
+    return InputBridge(mouse_mode_active)
+
+
 def main() -> None:
     args = parse_args()
+    ensure_admin(args)
     stop = threading.Event()
     mouse_mode_active = threading.Event()
-    bridge = InputBridge(mouse_mode_active)
+    bridge = create_input_bridge(args, mouse_mode_active)
 
     print("Cardputer-Adv Windows Remote server")
     print(f"Resolution: {args.width}x{args.height} at {args.fps:g} FPS")
+    print(f"Input backend: {args.input_backend}")
     print("Tip: run as Administrator if you need to control elevated windows.")
 
     threads = [

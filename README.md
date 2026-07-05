@@ -52,6 +52,8 @@ Setup steps:
 
 ## Windows Setup
 
+If you use the GitHub Actions build artifact, run `cardputer_adv_remote_win_server.exe`. It is built with an administrator manifest, so Windows should show a UAC prompt when it starts.
+
 Run these commands in PowerShell on the Windows PC:
 
 ```powershell
@@ -69,11 +71,21 @@ Useful options:
 python scripts\windows_remote_server.py --monitor 1 --fps 8
 python scripts\windows_remote_server.py --bind 192.168.1.100 --frame-port 5050 --input-port 5051
 python scripts\windows_remote_server.py --width 240 --height 135 --quality-filter nearest
+python scripts\windows_remote_server.py --input-backend pynput
 ```
 
 The firmware and server resolutions must match. The default is `240x135`, which fits the Cardputer landscape screen while keeping bandwidth modest.
 
+The default input backend is Win32 `SendInput` with keyboard scancodes. Use `--input-backend pynput` to fall back to the older injection path.
+
 While mouse mode is active, the Windows server draws the current mouse position into each frame as a full-screen crosshair: black/white/black vertical and horizontal pixel lines.
+
+## GitHub Actions Builds
+
+The `Build` workflow produces two downloadable artifacts:
+
+- `firmware-bins`: merged `0x0` flashable firmware images plus SHA-256 checksums.
+- `windows-server-exe`: a one-file Windows server exe built with PyInstaller and UAC administrator prompt enabled.
 
 ## Wi-Fi Behavior
 

@@ -1,0 +1,99 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    name: Firmware bins
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+
+      - name: Build firmware
+        run: pio run -e cardputer_adv -e cardputer_adv_opt_win
+
+      - name: Merge firmware bins
+        run: |
+          mkdir -p dist
+          python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
+            --output dist/cardputer_adv_remote_win_merged.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x0 .pio/build/cardputer_adv/bootloader.bin \
+            0x8000 .pio/build/cardputer_adv/partitions.bin \
+            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 .pio/build/cardputer_adv/firmware.bin
+          python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
+            --output dist/cardputer_adv_remote_win_opt_as_win_merged.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x0 .pio/build/cardputer_adv_opt_win/bootloader.bin \
+            0x8000 .pio/build/cardputer_adv_opt_win/partitions.bin \
+            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 .pio/build/cardputer_adv_opt_win/firmware.bin
+
+      - name: Checksums
+        run: sha256sum dist/*.bin | tee dist/SHA256SUMS.txt
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-bins
+          path: |
+            dist/*.bin
+            dist/SHA256SUMS.txt
+
+  windows-exe:
+    name: Windows server exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pyinstaller -r scripts\requirements-windows.txt
+
+      - name: Build exe
+        run: >
+          python -m PyInstaller
+          --clean
+          --noconfirm
+          --onefile
+          --console
+          --uac-admin
+          --name cardputer_adv_remote_win_server
+          scripts\windows_remote_server.py
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-FileHash dist\cardputer_adv_remote_win_server.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  dist/cardputer_adv_remote_win_server.exe" } |
+            Tee-Object -FilePath dist\SHA256SUMS.txt
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-server-exe
+          path: |
+            dist/cardputer_adv_remote_win_server.exe
+            dist/SHA256SUMS.txt
