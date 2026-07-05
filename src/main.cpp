@@ -114,14 +114,41 @@ struct KeySnapshot {
     bool backspace = false;
     bool esc = false;
     bool up = false;
+    bool left = false;
     bool down = false;
+    bool right = false;
     char chars[8] = {};
     uint8_t charCount = 0;
 
     bool hasAction() const {
-        return enter || backspace || esc || up || down || charCount > 0;
+        return enter || backspace || esc || up || left || down || right || charCount > 0;
+    }
+
+    bool hasChar(char target) const {
+        for (uint8_t i = 0; i < charCount; ++i) {
+            if (chars[i] == target) {
+                return true;
+            }
+        }
+        return false;
     }
 };
+
+bool navUp(const KeySnapshot& key) {
+    return key.up || key.hasChar(';');
+}
+
+bool navLeft(const KeySnapshot& key) {
+    return key.left || key.hasChar(',');
+}
+
+bool navDown(const KeySnapshot& key) {
+    return key.down || key.hasChar('.');
+}
+
+bool navRight(const KeySnapshot& key) {
+    return key.right || key.hasChar('/');
+}
 
 KeySnapshot waitKeyPress() {
     waitForKeyRelease();
@@ -134,7 +161,9 @@ KeySnapshot waitKeyPress() {
             key.backspace = state.backspace || state.del;
             key.esc = state.esc;
             key.up = state.up;
+            key.left = state.left;
             key.down = state.down;
+            key.right = state.right;
             for (const char c : state.word) {
                 if (key.charCount >= sizeof(key.chars)) {
                     break;
@@ -351,7 +380,7 @@ int selectScannedWifi(int networkCount) {
         display.setTextColor(TFT_GREEN, TFT_BLACK);
         display.println("Select WiFi");
         display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        display.println("W/S or arrows, Enter");
+        display.println(";/. or arrows, Enter");
 
         const int visibleRows = 8;
         int start = selected - visibleRows / 2;
@@ -379,10 +408,10 @@ int selectScannedWifi(int networkCount) {
         if (key.enter) {
             return selected;
         }
-        if (key.up || (key.charCount > 0 && (key.chars[0] == 'w' || key.chars[0] == 'W'))) {
+        if (navUp(key)) {
             selected = max(0, selected - 1);
         }
-        if (key.down || (key.charCount > 0 && (key.chars[0] == 's' || key.chars[0] == 'S'))) {
+        if (navDown(key)) {
             selected = min(networkCount - 1, selected + 1);
         }
     }
@@ -467,9 +496,9 @@ void runConfigMenu() {
     while (true) {
         drawConfigMenu(selected);
         const KeySnapshot key = waitKeyPress();
-        if (key.up || (key.charCount > 0 && (key.chars[0] == 'w' || key.chars[0] == 'W'))) {
+        if (navUp(key)) {
             selected = max(0, selected - 1);
-        } else if (key.down || (key.charCount > 0 && (key.chars[0] == 's' || key.chars[0] == 'S'))) {
+        } else if (navDown(key)) {
             selected = min(4, selected + 1);
         } else if (key.enter) {
             if (selected == 0) {
@@ -571,7 +600,10 @@ void drawFrame() {
     const int screenH = M5Cardputer.Display.height();
     const int x = max(0, (screenW - kFrameWidth) / 2);
     const int y = max(0, (screenH - kFrameHeight) / 2);
+    const bool oldSwapBytes = M5Cardputer.Display.getSwapBytes();
+    M5Cardputer.Display.setSwapBytes(true);
     M5Cardputer.Display.pushImage(x, y, kFrameWidth, kFrameHeight, frameBuffer);
+    M5Cardputer.Display.setSwapBytes(oldSwapBytes);
     hadFrame = true;
 }
 
@@ -611,6 +643,9 @@ InputReport buildInputReport() {
 
     auto& state = M5Cardputer.Keyboard.keysState();
     report.modifiers = state.modifiers;
+    if (state.opt) {
+        report.modifiers |= (1 << 3);  // USB HID left GUI, Windows key on the PC side.
+    }
 
     uint8_t index = 0;
     for (const uint8_t key : state.hid_keys) {

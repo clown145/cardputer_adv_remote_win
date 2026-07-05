@@ -36,7 +36,9 @@ On first boot, the setup menu opens automatically. On later boots, hold `M` duri
 
 Menu controls:
 
-- `W` / `S` or Fn-arrow keys: move selection.
+- `;` / `.`: move up/down in menus.
+- `,` / `/`: left/right direction keys where a screen uses them.
+- Fn-arrow keys also work as arrows.
 - `Enter`: select or save text.
 - `Backspace`: delete text while editing.
 - `Esc`: cancel text editing.
@@ -82,8 +84,7 @@ Most physical keys are sent as USB HID-style keyboard reports:
 - Regular letters, numbers, punctuation, Space, Tab, Enter, Backspace.
 - `Fn` layer for arrows, Escape, Delete, and F1-F12 as exposed by the M5Cardputer library.
 - Ctrl, Shift, and Alt modifiers are preserved.
-
-The Cardputer `Opt` key is currently not mapped to a Windows modifier because the M5 library exposes it separately from the HID modifier bitmap.
+- `Opt` maps to the Windows key.
 
 ## Troubleshooting
 
