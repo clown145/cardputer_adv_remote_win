@@ -84,7 +84,7 @@ Most physical keys are sent as USB HID-style keyboard reports:
 - Regular letters, numbers, punctuation, Space, Tab, Enter, Backspace.
 - `Fn` layer for arrows, Escape, Delete, and F1-F12 as exposed by the M5Cardputer library.
 - Ctrl, Shift, and Alt modifiers are preserved.
-- `Opt` maps to the Windows key.
+- `Opt` is not mapped in this recovery build.
 
 ## Troubleshooting
 

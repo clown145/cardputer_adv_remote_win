@@ -3,6 +3,10 @@
 #include <Preferences.h>
 #include <WiFi.h>
 
+#ifndef OPT_AS_WIN
+#define OPT_AS_WIN 0
+#endif
+
 namespace {
 
 constexpr uint16_t kDefaultFramePort = 5050;
@@ -643,9 +647,11 @@ InputReport buildInputReport() {
 
     auto& state = M5Cardputer.Keyboard.keysState();
     report.modifiers = state.modifiers;
+#if OPT_AS_WIN
     if (state.opt) {
         report.modifiers |= (1 << 3);  // USB HID left GUI, Windows key on the PC side.
     }
+#endif
 
     uint8_t index = 0;
     for (const uint8_t key : state.hid_keys) {
