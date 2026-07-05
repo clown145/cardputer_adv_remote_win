@@ -34,6 +34,21 @@ MOUSE_BUTTONS = {
     1: Button.right,
     2: Button.middle,
 }
+QUALITY_FILTER_CHOICES = ("nearest", "bilinear", "bicubic")
+INPUT_BACKEND_CHOICES = ("win32", "pynput")
+DEFAULT_CONFIG = {
+    "bind": "0.0.0.0",
+    "frame_port": 5050,
+    "input_port": 5051,
+    "width": 240,
+    "height": 135,
+    "fps": 6.0,
+    "monitor": 1,
+    "quality_filter": "bilinear",
+    "input_timeout": 4.0,
+    "input_backend": "win32",
+    "no_admin_relaunch": False,
+}
 
 
 HID_TO_SCANCODE = {
@@ -536,18 +551,24 @@ class Win32InputBridge:
         self.mouse.release_all()
 
 
+def make_server_args(**overrides: object) -> argparse.Namespace:
+    values = dict(DEFAULT_CONFIG)
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve Windows screen and keyboard control to a Cardputer-Adv.")
-    parser.add_argument("--bind", default="0.0.0.0", help="IP/interface to listen on.")
-    parser.add_argument("--frame-port", type=int, default=5050)
-    parser.add_argument("--input-port", type=int, default=5051)
-    parser.add_argument("--width", type=int, default=240)
-    parser.add_argument("--height", type=int, default=135)
-    parser.add_argument("--fps", type=float, default=6.0)
-    parser.add_argument("--monitor", type=int, default=1, help="mss monitor index. 1 is usually the primary display.")
-    parser.add_argument("--quality-filter", choices=("nearest", "bilinear", "bicubic"), default="bilinear")
-    parser.add_argument("--input-timeout", type=float, default=4.0, help="Seconds without input reports before reconnect.")
-    parser.add_argument("--input-backend", choices=("win32", "pynput"), default="win32")
+    parser.add_argument("--bind", default=DEFAULT_CONFIG["bind"], help="IP/interface to listen on.")
+    parser.add_argument("--frame-port", type=int, default=DEFAULT_CONFIG["frame_port"])
+    parser.add_argument("--input-port", type=int, default=DEFAULT_CONFIG["input_port"])
+    parser.add_argument("--width", type=int, default=DEFAULT_CONFIG["width"])
+    parser.add_argument("--height", type=int, default=DEFAULT_CONFIG["height"])
+    parser.add_argument("--fps", type=float, default=DEFAULT_CONFIG["fps"])
+    parser.add_argument("--monitor", type=int, default=DEFAULT_CONFIG["monitor"], help="mss monitor index. 1 is usually the primary display.")
+    parser.add_argument("--quality-filter", choices=QUALITY_FILTER_CHOICES, default=DEFAULT_CONFIG["quality_filter"])
+    parser.add_argument("--input-timeout", type=float, default=DEFAULT_CONFIG["input_timeout"], help="Seconds without input reports before reconnect.")
+    parser.add_argument("--input-backend", choices=INPUT_BACKEND_CHOICES, default=DEFAULT_CONFIG["input_backend"])
     parser.add_argument("--no-admin-relaunch", action="store_true", help="Do not relaunch through UAC on Windows.")
     return parser.parse_args()
 
@@ -600,9 +621,18 @@ def recv_line(conn: socket.socket, limit: int = 120) -> str:
     return data.decode("ascii", errors="replace").strip()
 
 
-def accept_client(server: socket.socket, channel: str, expected_width: int, expected_height: int) -> socket.socket:
-    while True:
-        conn, addr = server.accept()
+def accept_client(
+    server: socket.socket,
+    channel: str,
+    expected_width: int,
+    expected_height: int,
+    stop: threading.Event,
+) -> socket.socket | None:
+    while not stop.is_set():
+        try:
+            conn, addr = server.accept()
+        except socket.timeout:
+            continue
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.settimeout(5.0)
         hello = recv_line(conn)
@@ -621,6 +651,7 @@ def accept_client(server: socket.socket, channel: str, expected_width: int, expe
         else:
             print(f"{channel}: rejected bad hello", flush=True)
         conn.close()
+    return None
 
 
 def rgb_to_rgb565_bytes(image: Image.Image) -> bytes:
@@ -706,13 +737,16 @@ def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_act
     }[args.quality_filter]
 
     with socket.create_server((args.bind, args.frame_port), reuse_port=False) as server:
+        server.settimeout(0.5)
         server.listen(1)
         print(f"FRAME: listening on {args.bind}:{args.frame_port}", flush=True)
         frame_id = 0
         interval = 1.0 / max(args.fps, 0.1)
         mouse = MouseController()
         while not stop.is_set():
-            conn = accept_client(server, "FRAME", args.width, args.height)
+            conn = accept_client(server, "FRAME", args.width, args.height, stop)
+            if conn is None:
+                break
             try:
                 for payload in capture_frames(args.width, args.height, args.monitor, resize_filter, mouse, mouse_mode_active):
                     if stop.is_set():
@@ -764,12 +798,15 @@ def decode_input_report(data: bytes) -> KeyState | MouseState | None:
     return KeyState(modifiers=modifiers, keys=tuple(k for k in keys[:key_count] if k))
 
 
-def input_server(args: argparse.Namespace, bridge: InputBridge, stop: threading.Event) -> None:
+def input_server(args: argparse.Namespace, bridge: InputBridge | Win32InputBridge, stop: threading.Event) -> None:
     with socket.create_server((args.bind, args.input_port), reuse_port=False) as server:
+        server.settimeout(0.5)
         server.listen(1)
         print(f"INPUT: listening on {args.bind}:{args.input_port}", flush=True)
         while not stop.is_set():
-            conn = accept_client(server, "INPUT", args.width, args.height)
+            conn = accept_client(server, "INPUT", args.width, args.height, stop)
+            if conn is None:
+                break
             conn.settimeout(args.input_timeout)
             try:
                 while not stop.is_set():
@@ -792,16 +829,18 @@ def create_input_bridge(args: argparse.Namespace, mouse_mode_active: threading.E
     return InputBridge(mouse_mode_active)
 
 
-def main() -> None:
-    args = parse_args()
-    ensure_admin(args)
-    stop = threading.Event()
+def run_server(args: argparse.Namespace, stop: threading.Event | None = None) -> None:
+    if stop is None:
+        stop = threading.Event()
     mouse_mode_active = threading.Event()
     bridge = create_input_bridge(args, mouse_mode_active)
 
     print("Cardputer-Adv Windows Remote server")
     print(f"Resolution: {args.width}x{args.height} at {args.fps:g} FPS")
+    print(f"Monitor: {args.monitor}")
+    print(f"Quality filter: {args.quality_filter}")
     print(f"Input backend: {args.input_backend}")
+    print(f"Administrator: {'yes' if is_admin() else 'no'}")
     print("Tip: run as Administrator if you need to control elevated windows.")
 
     threads = [
@@ -812,13 +851,21 @@ def main() -> None:
         thread.start()
 
     try:
-        while all(thread.is_alive() for thread in threads):
+        while not stop.is_set() and all(thread.is_alive() for thread in threads):
             time.sleep(0.25)
     except KeyboardInterrupt:
         print("\nStopping...", flush=True)
     finally:
         stop.set()
         bridge.release_all()
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+
+def main() -> None:
+    args = parse_args()
+    ensure_admin(args)
+    run_server(args)
 
 
 if __name__ == "__main__":

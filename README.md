@@ -8,6 +8,7 @@ This is a practical first version, not a full RDP/VNC replacement. Expect low-re
 
 - `src/main.cpp` - Arduino/PlatformIO firmware for Cardputer-Adv.
 - `scripts/windows_remote_server.py` - Windows capture and keyboard injection service.
+- `scripts/windows_remote_gui.py` - Windows GUI control panel for the service.
 - `scripts/requirements-windows.txt` - Python dependencies for the Windows service.
 - `docs/protocol.md` - wire protocol details.
 
@@ -52,7 +53,11 @@ Setup steps:
 
 ## Windows Setup
 
-If you use the GitHub Actions build artifact, run `cardputer_adv_remote_win_server.exe`. It is built with an administrator manifest, so Windows should show a UAC prompt when it starts.
+If you use the GitHub Actions build artifact, download `windows-exes` and run `cardputer_adv_remote_win.exe`. It is built with an administrator manifest, so Windows should show a UAC prompt when it starts. The GUI can adjust stream mode, FPS, monitor, scaling filter, ports, and input backend. Click `Start` after choosing the settings.
+
+The GUI saves settings in the user config folder, for example `%APPDATA%\CardputerAdvRemote\settings.json`, not beside the exe and not in the repo root. It also shows the PC LAN IPv4 address to enter on the Cardputer setup screen.
+
+The console build is still available as `cardputer_adv_remote_win_server.exe` for debugging.
 
 Run these commands in PowerShell on the Windows PC:
 
@@ -60,6 +65,12 @@ Run these commands in PowerShell on the Windows PC:
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r scripts\requirements-windows.txt
+python scripts\windows_remote_gui.py
+```
+
+Or run the server directly without the GUI:
+
+```powershell
 python scripts\windows_remote_server.py --width 240 --height 135 --fps 6
 ```
 
@@ -85,7 +96,7 @@ While mouse mode is active, the Windows server draws the current mouse position 
 The `Build` workflow produces two downloadable artifacts:
 
 - `firmware-bins`: merged `0x0` flashable firmware images plus SHA-256 checksums.
-- `windows-server-exe`: a one-file Windows server exe built with PyInstaller and UAC administrator prompt enabled.
+- `windows-exes`: a one-file GUI exe and a one-file console server exe built with PyInstaller and UAC administrator prompt enabled.
 
 ## Wi-Fi Behavior
 
@@ -98,7 +109,7 @@ Most physical keys are sent as USB HID-style keyboard reports:
 - Regular letters, numbers, punctuation, Space, Tab, Enter, Backspace.
 - `Fn` layer for arrows, Escape, Delete, and F1-F12 as exposed by the M5Cardputer library. On Cardputer-Adv, `Fn+;`, `Fn+,`, `Fn+.`, and `Fn+/` are up/left/down/right.
 - Ctrl, Shift, and Alt modifiers are preserved.
-- `Opt` is not mapped in this recovery build.
+- The `cardputer_adv_opt_win` firmware build maps `Opt` to the Windows key.
 
 Mouse mode:
 

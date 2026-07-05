@@ -57,7 +57,7 @@ jobs:
             dist/SHA256SUMS.txt
 
   windows-exe:
-    name: Windows server exe
+    name: Windows exes
     runs-on: windows-latest
 
     steps:
@@ -72,7 +72,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pyinstaller -r scripts\requirements-windows.txt
 
-      - name: Build exe
+      - name: Build console server exe
         run: >
           python -m PyInstaller
           --clean
@@ -83,17 +83,32 @@ jobs:
           --name cardputer_adv_remote_win_server
           scripts\windows_remote_server.py
 
+      - name: Build GUI exe
+        run: >
+          python -m PyInstaller
+          --clean
+          --noconfirm
+          --onefile
+          --windowed
+          --uac-admin
+          --name cardputer_adv_remote_win
+          scripts\windows_remote_gui.py
+
       - name: Checksums
         shell: pwsh
         run: |
-          Get-FileHash dist\cardputer_adv_remote_win_server.exe -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  dist/cardputer_adv_remote_win_server.exe" } |
+          Get-ChildItem dist\*.exe |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              "$($hash.Hash.ToLower())  dist/$($_.Name)"
+            } |
             Tee-Object -FilePath dist\SHA256SUMS.txt
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-server-exe
+          name: windows-exes
           path: |
-            dist/cardputer_adv_remote_win_server.exe
+            dist/*.exe
             dist/SHA256SUMS.txt
