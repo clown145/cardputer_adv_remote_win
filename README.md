@@ -73,6 +73,8 @@ python scripts\windows_remote_server.py --width 240 --height 135 --quality-filte
 
 The firmware and server resolutions must match. The default is `240x135`, which fits the Cardputer landscape screen while keeping bandwidth modest.
 
+While mouse mode is active, the Windows server draws the current mouse position into each frame as a full-screen crosshair: black/white/black vertical and horizontal pixel lines.
+
 ## Wi-Fi Behavior
 
 On boot, the firmware loads the saved SSID/password from device NVS and connects automatically. To change Wi-Fi, hold `M` during startup, scan again, and save the new network.
@@ -82,15 +84,23 @@ On boot, the firmware loads the saved SSID/password from device NVS and connects
 Most physical keys are sent as USB HID-style keyboard reports:
 
 - Regular letters, numbers, punctuation, Space, Tab, Enter, Backspace.
-- `Fn` layer for arrows, Escape, Delete, and F1-F12 as exposed by the M5Cardputer library.
+- `Fn` layer for arrows, Escape, Delete, and F1-F12 as exposed by the M5Cardputer library. On Cardputer-Adv, `Fn+;`, `Fn+,`, `Fn+.`, and `Fn+/` are up/left/down/right.
 - Ctrl, Shift, and Alt modifiers are preserved.
 - `Opt` is not mapped in this recovery build.
+
+Mouse mode:
+
+- `Fn+M`: toggle mouse mode.
+- `;` / `.` / `,` / `/`: move the pointer up/down/left/right.
+- `Fn+;` / `Fn+.`: scroll up/down unless a mouse button is held.
+- Hold `Enter` or Space while moving: left mouse button drag.
+- Backspace or `Fn+Backspace`: right mouse button.
 
 ## Troubleshooting
 
 - If the Cardputer opens setup on boot, complete Wi-Fi and Windows IP on the device.
 - If the Cardputer shows "Waiting for Windows host", confirm the Windows script is running, the saved Windows IP is correct, and the PC firewall allows inbound TCP ports `5050` and `5051`.
-- If the display connects but keys do nothing, run the Windows script as Administrator and focus a normal text window first.
+- If the display connects but keys do nothing, run the Windows script as Administrator and focus a normal text window first. The input connection times out and reconnects automatically if the Cardputer reboots.
 - If the screen is garbled or rejected, make sure the Windows server uses `--width 240 --height 135`.
 - If upload fails on Cardputer-Adv, use the back-side `BtnG0` + `BtnRST` bootloader sequence described above.
 
@@ -98,5 +108,4 @@ Most physical keys are sent as USB HID-style keyboard reports:
 
 - No encryption or authentication. Use only on a trusted LAN.
 - Screen stream is raw RGB565 over TCP, so it favors simplicity over bandwidth.
-- Keyboard-only control in this version. Mouse mode can be added on the same input channel.
 - Only one Cardputer client is served at a time.

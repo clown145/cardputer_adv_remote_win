@@ -17,12 +17,21 @@ constexpr uint32_t kConnectRetryMs = 3000;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint32_t kMenuBootWindowMs = 1800;
 constexpr uint32_t kMagic = 0x41575243;  // "CRWA" little endian
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kFrameProtocolVersion = 1;
+constexpr uint16_t kInputProtocolVersion = 2;
 constexpr size_t kFrameBytes = kFrameWidth * kFrameHeight * sizeof(uint16_t);
 constexpr uint32_t kStatusRedrawMs = 1000;
 constexpr uint32_t kFrameTimeoutMs = 2500;
 constexpr uint32_t kInputKeepaliveMs = 1000;
+constexpr uint32_t kMouseReportIntervalMs = 25;
+constexpr uint32_t kMouseWheelIntervalMs = 120;
 constexpr uint8_t kMaxHidKeys = 6;
+constexpr uint8_t kMouseReportFlag = 0x80;
+constexpr uint8_t kMouseModeActiveFlag = 1 << 3;
+constexpr uint8_t kMouseButtonLeft = 1 << 0;
+constexpr uint8_t kMouseButtonRight = 1 << 1;
+constexpr int8_t kMouseStep = 8;
+constexpr int8_t kMouseFastStep = 18;
 constexpr char kConfigNamespace[] = "remote_cfg";
 
 struct RuntimeConfig {
@@ -75,7 +84,13 @@ uint32_t lastFrameAt = 0;
 uint32_t lastInputAt = 0;
 uint32_t lastConnectAttemptAt = 0;
 uint32_t lastStatusAt = 0;
+uint32_t lastMouseReportAt = 0;
+uint32_t lastMouseWheelAt = 0;
+uint8_t lastMouseButtons = 0;
 bool hadFrame = false;
+bool mouseMode = false;
+bool mouseToggleHeld = false;
+bool inputJustConnected = false;
 
 InputReport lastReport = {};
 
@@ -103,6 +118,7 @@ void drawStatus(const char* line1, const char* line2 = nullptr, const char* line
         display.printf("SSID: %s\n", WiFi.SSID().c_str());
     }
     display.printf("Host: %s\n", appConfig.host.length() ? appConfig.host.c_str() : "not set");
+    display.printf("Mode: %s\n", mouseMode ? "mouse" : "keyboard");
     display.printf("Frames: %lu\n", static_cast<unsigned long>(lastFrameId));
 }
 
@@ -587,7 +603,14 @@ void ensureConnections() {
         inputClient.stop();
         if (inputClient.connect(appConfig.host.c_str(), appConfig.inputPort)) {
             inputClient.setNoDelay(true);
-            sendHello(inputClient, "INPUT");
+            if (sendHello(inputClient, "INPUT")) {
+                lastReport = {};
+                lastInputAt = 0;
+                lastMouseButtons = 0;
+                inputJustConnected = true;
+            } else {
+                inputClient.stop();
+            }
         }
     }
 
@@ -597,6 +620,19 @@ void ensureConnections() {
     } else {
         drawStatus("Connected to host", "Waiting for frames...");
     }
+}
+
+void drawMouseBadge() {
+    if (!mouseMode || !hadFrame) {
+        return;
+    }
+    auto& display = M5Cardputer.Display;
+    display.setTextDatum(top_left);
+    display.setTextSize(1);
+    display.fillRect(M5Cardputer.Display.width() - 44, 0, 44, 12, TFT_BLACK);
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.setCursor(M5Cardputer.Display.width() - 42, 1);
+    display.print("MOUSE");
 }
 
 void drawFrame() {
@@ -609,6 +645,7 @@ void drawFrame() {
     M5Cardputer.Display.pushImage(x, y, kFrameWidth, kFrameHeight, frameBuffer);
     M5Cardputer.Display.setSwapBytes(oldSwapBytes);
     hadFrame = true;
+    drawMouseBadge();
 }
 
 void processFrameStream() {
@@ -622,7 +659,7 @@ void processFrameStream() {
         return;
     }
 
-    if (header.magic != kMagic || header.version != kProtocolVersion || header.width != kFrameWidth ||
+    if (header.magic != kMagic || header.version != kFrameProtocolVersion || header.width != kFrameWidth ||
         header.height != kFrameHeight || header.format != 1 || header.payload_len != kFrameBytes) {
         drawStatus("Bad frame header", "Check server resolution");
         frameClient.stop();
@@ -639,11 +676,16 @@ void processFrameStream() {
     drawFrame();
 }
 
-InputReport buildInputReport() {
+InputReport makeInputReportBase() {
     InputReport report = {};
     report.magic = kMagic;
-    report.version = kProtocolVersion;
+    report.version = kInputProtocolVersion;
     report.sequence = ++lastSequence;
+    return report;
+}
+
+InputReport buildKeyboardReport() {
+    InputReport report = makeInputReportBase();
 
     auto& state = M5Cardputer.Keyboard.keysState();
     report.modifiers = state.modifiers;
@@ -679,30 +721,158 @@ bool sameKeys(const InputReport& a, const InputReport& b) {
     return true;
 }
 
-void sendInputReportIfNeeded(bool force = false) {
+bool sendInputReport(const InputReport& report) {
     if (!inputClient.connected()) {
-        return;
+        return false;
     }
 
-    const InputReport report = buildInputReport();
+    if (writeExact(inputClient, reinterpret_cast<const uint8_t*>(&report), sizeof(report))) {
+        lastInputAt = millis();
+        return true;
+    }
+
+    inputClient.stop();
+    return false;
+}
+
+void sendKeyboardReportIfNeeded(bool force = false) {
+    const InputReport report = buildKeyboardReport();
     if (!force && sameKeys(report, lastReport)) {
         return;
     }
 
-    if (writeExact(inputClient, reinterpret_cast<const uint8_t*>(&report), sizeof(report))) {
+    if (sendInputReport(report)) {
         lastReport = report;
-        lastInputAt = millis();
-    } else {
-        inputClient.stop();
+    }
+}
+
+void sendKeyboardReleaseReport() {
+    const InputReport report = makeInputReportBase();
+    if (sendInputReport(report)) {
+        lastReport = report;
+    }
+}
+
+bool sendMouseReport(int8_t dx, int8_t dy, int8_t wheel, uint8_t buttons, bool active = true) {
+    InputReport report = makeInputReportBase();
+    report.key_count = kMouseReportFlag | (active ? kMouseModeActiveFlag : 0) | (buttons & 0x07);
+    report.keys[0] = static_cast<uint8_t>(dx);
+    report.keys[1] = static_cast<uint8_t>(dy);
+    report.keys[2] = static_cast<uint8_t>(wheel);
+
+    if (sendInputReport(report)) {
+        lastMouseButtons = buttons;
+        lastMouseReportAt = millis();
+        return true;
+    }
+    return false;
+}
+
+bool keyPressed(char normal, char shifted) {
+    return M5Cardputer.Keyboard.isKeyPressed(normal) || M5Cardputer.Keyboard.isKeyPressed(shifted);
+}
+
+void setMouseMode(bool enabled) {
+    mouseMode = enabled;
+    lastMouseButtons = 0;
+    lastMouseReportAt = 0;
+    lastMouseWheelAt = 0;
+    sendKeyboardReleaseReport();
+    sendMouseReport(0, 0, 0, 0, enabled);
+    drawStatus(enabled ? "Mouse mode" : "Keyboard mode", enabled ? ";.,/ move  Fn+;/. wheel" : "Fn+M toggles mouse");
+}
+
+bool handleMouseToggle() {
+    auto& state = M5Cardputer.Keyboard.keysState();
+    const bool togglePressed = state.fn && keyPressed('m', 'M');
+    const bool toggled = togglePressed && !mouseToggleHeld;
+    mouseToggleHeld = togglePressed;
+    if (toggled) {
+        setMouseMode(!mouseMode);
+    }
+    return toggled;
+}
+
+void processInputReconnect() {
+    if (!inputJustConnected || !inputClient.connected()) {
+        return;
+    }
+    inputJustConnected = false;
+    sendKeyboardReleaseReport();
+    if (mouseMode) {
+        sendMouseReport(0, 0, 0, 0, true);
+    }
+}
+
+void processMouseInput() {
+    if (!inputClient.connected()) {
+        return;
+    }
+
+    auto& state = M5Cardputer.Keyboard.keysState();
+    const uint32_t now = millis();
+
+    uint8_t buttons = 0;
+    if (state.enter || state.space) {
+        buttons |= kMouseButtonLeft;
+    }
+    if (state.backspace || state.del) {
+        buttons |= kMouseButtonRight;
+    }
+
+    const bool dragging = buttons != 0;
+    const bool scrollUp = state.fn && state.up && !dragging;
+    const bool scrollDown = state.fn && state.down && !dragging;
+    const bool moveUp = (state.up || keyPressed(';', ':')) && !scrollUp;
+    const bool moveDown = (state.down || keyPressed('.', '>')) && !scrollDown;
+    const bool moveLeft = state.left || keyPressed(',', '<');
+    const bool moveRight = state.right || keyPressed('/', '?');
+    const int8_t step = state.shift ? kMouseFastStep : kMouseStep;
+
+    int8_t dx = 0;
+    int8_t dy = 0;
+    if (moveLeft != moveRight) {
+        dx = moveLeft ? -step : step;
+    }
+    if (moveUp != moveDown) {
+        dy = moveUp ? -step : step;
+    }
+
+    if (now - lastMouseReportAt < kMouseReportIntervalMs) {
+        dx = 0;
+        dy = 0;
+    }
+
+    int8_t wheel = 0;
+    if (scrollUp != scrollDown && now - lastMouseWheelAt >= kMouseWheelIntervalMs) {
+        wheel = scrollUp ? 1 : -1;
+        lastMouseWheelAt = now;
+    }
+
+    const bool buttonsChanged = buttons != lastMouseButtons;
+    const bool keepalive = now - lastInputAt > kInputKeepaliveMs;
+    if (dx || dy || wheel || buttonsChanged || keepalive) {
+        sendMouseReport(dx, dy, wheel, buttons, true);
     }
 }
 
 void processKeyboard() {
     M5Cardputer.update();
-    sendInputReportIfNeeded(false);
+    processInputReconnect();
+
+    if (handleMouseToggle()) {
+        return;
+    }
+
+    if (mouseMode) {
+        processMouseInput();
+        return;
+    }
+
+    sendKeyboardReportIfNeeded(false);
 
     if (inputClient.connected() && millis() - lastInputAt > kInputKeepaliveMs) {
-        sendInputReportIfNeeded(true);
+        sendKeyboardReportIfNeeded(true);
     }
 }
 

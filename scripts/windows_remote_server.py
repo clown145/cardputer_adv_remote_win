@@ -11,16 +11,25 @@ import time
 from dataclasses import dataclass
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from mss import mss
-from pynput.keyboard import Controller, Key
+from pynput.keyboard import Controller as KeyboardController, Key
+from pynput.mouse import Button, Controller as MouseController
 
 
 MAGIC = 0x41575243  # "CRWA" little endian
-VERSION = 1
+FRAME_VERSION = 1
+INPUT_VERSIONS = {1, 2}
 FORMAT_RGB565 = 1
 FRAME_HEADER = struct.Struct("<IHHHHII")
 INPUT_REPORT = struct.Struct("<IHHBB6B")
+MOUSE_REPORT_FLAG = 0x80
+MOUSE_MODE_ACTIVE = 0x08
+MOUSE_BUTTONS = {
+    0: Button.left,
+    1: Button.right,
+    2: Button.middle,
+}
 
 
 HID_TO_PYNPUT = {
@@ -131,9 +140,26 @@ class KeyState:
         return pressed
 
 
+@dataclass(frozen=True)
+class MouseState:
+    active: bool
+    buttons: int
+    dx: int
+    dy: int
+    wheel: int
+
+    @property
+    def button_objects(self) -> set[Button]:
+        pressed: set[Button] = set()
+        for bit, button in MOUSE_BUTTONS.items():
+            if self.buttons & (1 << bit):
+                pressed.add(button)
+        return pressed
+
+
 class KeyboardBridge:
     def __init__(self) -> None:
-        self.keyboard = Controller()
+        self.keyboard = KeyboardController()
         self.current: set[object] = set()
         self.lock = threading.Lock()
 
@@ -166,6 +192,58 @@ class KeyboardBridge:
             self.current.clear()
 
 
+class MouseBridge:
+    def __init__(self, mode_active: threading.Event) -> None:
+        self.mouse = MouseController()
+        self.mode_active = mode_active
+        self.current_buttons: set[Button] = set()
+        self.lock = threading.Lock()
+
+    def apply(self, state: MouseState) -> None:
+        if not state.active:
+            self.mode_active.clear()
+            self.release_all()
+            return
+
+        self.mode_active.set()
+        target_buttons = state.button_objects
+        with self.lock:
+            for button in self.current_buttons - target_buttons:
+                self.mouse.release(button)
+            for button in target_buttons - self.current_buttons:
+                self.mouse.press(button)
+            self.current_buttons = target_buttons
+
+            if state.dx or state.dy:
+                self.mouse.move(state.dx, state.dy)
+            if state.wheel:
+                self.mouse.scroll(0, state.wheel)
+
+    def release_all(self) -> None:
+        self.mode_active.clear()
+        with self.lock:
+            for button in list(self.current_buttons):
+                self.mouse.release(button)
+            self.current_buttons.clear()
+
+
+class InputBridge:
+    def __init__(self, mouse_mode_active: threading.Event) -> None:
+        self.keyboard = KeyboardBridge()
+        self.mouse = MouseBridge(mouse_mode_active)
+
+    def apply(self, state: KeyState | MouseState) -> None:
+        if isinstance(state, KeyState):
+            self.mouse.release_all()
+            self.keyboard.apply(state)
+        else:
+            self.mouse.apply(state)
+
+    def release_all(self) -> None:
+        self.keyboard.release_all()
+        self.mouse.release_all()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve Windows screen and keyboard control to a Cardputer-Adv.")
     parser.add_argument("--bind", default="0.0.0.0", help="IP/interface to listen on.")
@@ -176,13 +254,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=6.0)
     parser.add_argument("--monitor", type=int, default=1, help="mss monitor index. 1 is usually the primary display.")
     parser.add_argument("--quality-filter", choices=("nearest", "bilinear", "bicubic"), default="bilinear")
+    parser.add_argument("--input-timeout", type=float, default=4.0, help="Seconds without input reports before reconnect.")
     return parser.parse_args()
 
 
 def recv_line(conn: socket.socket, limit: int = 120) -> str:
     data = bytearray()
     while len(data) < limit:
-        chunk = conn.recv(1)
+        try:
+            chunk = conn.recv(1)
+        except socket.timeout:
+            break
         if not chunk:
             break
         data.extend(chunk)
@@ -195,6 +277,7 @@ def accept_client(server: socket.socket, channel: str, expected_width: int, expe
     while True:
         conn, addr = server.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(5.0)
         hello = recv_line(conn)
         print(f"{channel}: connection from {addr[0]}:{addr[1]} -> {hello}", flush=True)
         parts = hello.split()
@@ -205,6 +288,7 @@ def accept_client(server: socket.socket, channel: str, expected_width: int, expe
             except ValueError:
                 width = height = -1
             if width == expected_width and height == expected_height:
+                conn.settimeout(None)
                 return conn
             print(f"{channel}: rejected resolution {width}x{height}", flush=True)
         else:
@@ -224,7 +308,51 @@ def rgb_to_rgb565_bytes(image: Image.Image) -> bytes:
     return bytes(out)
 
 
-def capture_frames(width: int, height: int, monitor_index: int, resize_filter: int) -> Iterable[bytes]:
+def draw_cursor_crosshair(
+    canvas: Image.Image,
+    monitor: dict[str, int],
+    image_x: int,
+    image_y: int,
+    image_w: int,
+    image_h: int,
+    mouse: MouseController,
+) -> None:
+    cursor_x, cursor_y = mouse.position
+    monitor_left = monitor["left"]
+    monitor_top = monitor["top"]
+    monitor_w = monitor["width"]
+    monitor_h = monitor["height"]
+
+    if not (monitor_left <= cursor_x < monitor_left + monitor_w and monitor_top <= cursor_y < monitor_top + monitor_h):
+        return
+
+    frame_x = image_x + int((cursor_x - monitor_left) * image_w / monitor_w)
+    frame_y = image_y + int((cursor_y - monitor_top) * image_h / monitor_h)
+    frame_x = max(0, min(canvas.width - 1, frame_x))
+    frame_y = max(0, min(canvas.height - 1, frame_y))
+
+    draw = ImageDraw.Draw(canvas)
+    black = (0, 0, 0)
+    white = (255, 255, 255)
+
+    for x in (frame_x - 1, frame_x + 1):
+        if 0 <= x < canvas.width:
+            draw.line((x, 0, x, canvas.height - 1), fill=black)
+    for y in (frame_y - 1, frame_y + 1):
+        if 0 <= y < canvas.height:
+            draw.line((0, y, canvas.width - 1, y), fill=black)
+    draw.line((frame_x, 0, frame_x, canvas.height - 1), fill=white)
+    draw.line((0, frame_y, canvas.width - 1, frame_y), fill=white)
+
+
+def capture_frames(
+    width: int,
+    height: int,
+    monitor_index: int,
+    resize_filter: int,
+    mouse: MouseController,
+    mouse_mode_active: threading.Event,
+) -> Iterable[bytes]:
     with mss() as screen:
         if monitor_index < 0 or monitor_index >= len(screen.monitors):
             raise SystemExit(f"Monitor {monitor_index} does not exist. Available: 0..{len(screen.monitors) - 1}")
@@ -238,10 +366,12 @@ def capture_frames(width: int, height: int, monitor_index: int, resize_filter: i
             x = (width - image.width) // 2
             y = (height - image.height) // 2
             canvas.paste(image, (x, y))
+            if mouse_mode_active.is_set():
+                draw_cursor_crosshair(canvas, monitor, x, y, image.width, image.height, mouse)
             yield rgb_to_rgb565_bytes(canvas)
 
 
-def frame_server(args: argparse.Namespace, stop: threading.Event) -> None:
+def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_active: threading.Event) -> None:
     resize_filter = {
         "nearest": Image.Resampling.NEAREST,
         "bilinear": Image.Resampling.BILINEAR,
@@ -253,16 +383,17 @@ def frame_server(args: argparse.Namespace, stop: threading.Event) -> None:
         print(f"FRAME: listening on {args.bind}:{args.frame_port}", flush=True)
         frame_id = 0
         interval = 1.0 / max(args.fps, 0.1)
+        mouse = MouseController()
         while not stop.is_set():
             conn = accept_client(server, "FRAME", args.width, args.height)
             try:
-                for payload in capture_frames(args.width, args.height, args.monitor, resize_filter):
+                for payload in capture_frames(args.width, args.height, args.monitor, resize_filter, mouse, mouse_mode_active):
                     if stop.is_set():
                         break
                     frame_id = (frame_id + 1) & 0xFFFFFFFF
                     header = FRAME_HEADER.pack(
                         MAGIC,
-                        VERSION,
+                        FRAME_VERSION,
                         args.width,
                         args.height,
                         FORMAT_RGB565,
@@ -279,34 +410,48 @@ def frame_server(args: argparse.Namespace, stop: threading.Event) -> None:
                 conn.close()
 
 
-def decode_input_report(data: bytes) -> KeyState | None:
+def to_i8(value: int) -> int:
+    return value - 256 if value & 0x80 else value
+
+
+def recv_exact(conn: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("input connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def decode_input_report(data: bytes) -> KeyState | MouseState | None:
     magic, version, sequence, modifiers, key_count, *keys = INPUT_REPORT.unpack(data)
-    if magic != MAGIC or version != VERSION:
+    if magic != MAGIC or version not in INPUT_VERSIONS:
         print(f"INPUT: bad report magic/version: {magic:#x}/{version}", flush=True)
         return None
+    if key_count & MOUSE_REPORT_FLAG:
+        active = bool(key_count & MOUSE_MODE_ACTIVE)
+        buttons = key_count & 0x07
+        return MouseState(active=active, buttons=buttons, dx=to_i8(keys[0]), dy=to_i8(keys[1]), wheel=to_i8(keys[2]))
     key_count = min(key_count, len(keys))
     return KeyState(modifiers=modifiers, keys=tuple(k for k in keys[:key_count] if k))
 
 
-def input_server(args: argparse.Namespace, bridge: KeyboardBridge, stop: threading.Event) -> None:
+def input_server(args: argparse.Namespace, bridge: InputBridge, stop: threading.Event) -> None:
     with socket.create_server((args.bind, args.input_port), reuse_port=False) as server:
         server.listen(1)
         print(f"INPUT: listening on {args.bind}:{args.input_port}", flush=True)
         while not stop.is_set():
             conn = accept_client(server, "INPUT", args.width, args.height)
+            conn.settimeout(args.input_timeout)
             try:
                 while not stop.is_set():
-                    data = conn.recv(INPUT_REPORT.size)
-                    if not data:
-                        break
-                    while len(data) < INPUT_REPORT.size:
-                        more = conn.recv(INPUT_REPORT.size - len(data))
-                        if not more:
-                            raise ConnectionError("short input report")
-                        data += more
+                    data = recv_exact(conn, INPUT_REPORT.size)
                     state = decode_input_report(data)
                     if state is not None:
                         bridge.apply(state)
+            except socket.timeout:
+                print(f"INPUT: disconnected (no reports for {args.input_timeout:g}s)", flush=True)
             except (ConnectionError, OSError) as exc:
                 print(f"INPUT: disconnected ({exc})", flush=True)
             finally:
@@ -317,14 +462,15 @@ def input_server(args: argparse.Namespace, bridge: KeyboardBridge, stop: threadi
 def main() -> None:
     args = parse_args()
     stop = threading.Event()
-    bridge = KeyboardBridge()
+    mouse_mode_active = threading.Event()
+    bridge = InputBridge(mouse_mode_active)
 
     print("Cardputer-Adv Windows Remote server")
     print(f"Resolution: {args.width}x{args.height} at {args.fps:g} FPS")
     print("Tip: run as Administrator if you need to control elevated windows.")
 
     threads = [
-        threading.Thread(target=frame_server, args=(args, stop), daemon=True),
+        threading.Thread(target=frame_server, args=(args, stop, mouse_mode_active), daemon=True),
         threading.Thread(target=input_server, args=(args, bridge, stop), daemon=True),
     ]
     for thread in threads:
