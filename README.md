@@ -119,6 +119,15 @@ Mouse mode:
 - Hold `Enter` or Space while moving: left mouse button drag.
 - Backspace or `Fn+Backspace`: right mouse button.
 
+Game mode:
+
+- `Fn+G`: toggle game mode.
+- Physical `W` and `E` are swapped before sending to Windows.
+- `;` / `.` / `,` / `/` and the arrow layer control mouse-look.
+- `L`: left mouse button.
+- `'`: right mouse button.
+- `Fn+;` / `Fn+.`: scroll up/down.
+
 ## Troubleshooting
 
 - If the Cardputer opens setup on boot, complete Wi-Fi and Windows IP on the device.

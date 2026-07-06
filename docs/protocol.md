@@ -58,7 +58,7 @@ For keyboard reports, `modifiers` follows the USB HID keyboard bitmap:
 - bit 6: right alt
 - bit 7: right GUI
 
-For mouse reports, `key_count & 0x80` marks the report as mouse input. `key_count & 0x08` marks mouse mode as active; when that bit is clear, the host releases mouse buttons and hides the crosshair. The low bits of `key_count` are mouse buttons:
+For mouse reports, `key_count & 0x80` marks the report as mouse input. `key_count & 0x08` marks mouse input as active; when that bit is clear, the host releases mouse buttons and hides the crosshair. `key_count & 0x10` keeps mouse input active while hiding the crosshair, used by game mode. The low bits of `key_count` are mouse buttons:
 
 - bit 0: left button
 - bit 1: right button

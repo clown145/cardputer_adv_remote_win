@@ -29,6 +29,7 @@ FRAME_HEADER = struct.Struct("<IHHHHII")
 INPUT_REPORT = struct.Struct("<IHHBB6B")
 MOUSE_REPORT_FLAG = 0x80
 MOUSE_MODE_ACTIVE = 0x08
+MOUSE_HIDE_CROSSHAIR = 0x10
 MOUSE_BUTTONS = {
     0: Button.left,
     1: Button.right,
@@ -247,6 +248,7 @@ class KeyState:
 @dataclass(frozen=True)
 class MouseState:
     active: bool
+    crosshair: bool
     buttons: int
     dx: int
     dy: int
@@ -309,7 +311,10 @@ class MouseBridge:
             self.release_all()
             return
 
-        self.mode_active.set()
+        if state.crosshair:
+            self.mode_active.set()
+        else:
+            self.mode_active.clear()
         target_buttons = state.button_objects
         with self.lock:
             for button in self.current_buttons - target_buttons:
@@ -338,7 +343,6 @@ class InputBridge:
 
     def apply(self, state: KeyState | MouseState) -> None:
         if isinstance(state, KeyState):
-            self.mouse.release_all()
             self.keyboard.apply(state)
         else:
             self.mouse.apply(state)
@@ -511,7 +515,10 @@ class Win32MouseBridge:
             self.release_all()
             return
 
-        self.mode_active.set()
+        if state.crosshair:
+            self.mode_active.set()
+        else:
+            self.mode_active.clear()
         target_buttons = {bit for bit in self.BUTTON_EVENTS if state.buttons & (1 << bit)}
         with self.lock:
             for bit in self.current_buttons - target_buttons:
@@ -541,7 +548,6 @@ class Win32InputBridge:
 
     def apply(self, state: KeyState | MouseState) -> None:
         if isinstance(state, KeyState):
-            self.mouse.release_all()
             self.keyboard.apply(state)
         else:
             self.mouse.apply(state)
@@ -792,8 +798,16 @@ def decode_input_report(data: bytes) -> KeyState | MouseState | None:
         return None
     if key_count & MOUSE_REPORT_FLAG:
         active = bool(key_count & MOUSE_MODE_ACTIVE)
+        crosshair = active and not bool(key_count & MOUSE_HIDE_CROSSHAIR)
         buttons = key_count & 0x07
-        return MouseState(active=active, buttons=buttons, dx=to_i8(keys[0]), dy=to_i8(keys[1]), wheel=to_i8(keys[2]))
+        return MouseState(
+            active=active,
+            crosshair=crosshair,
+            buttons=buttons,
+            dx=to_i8(keys[0]),
+            dy=to_i8(keys[1]),
+            wheel=to_i8(keys[2]),
+        )
     key_count = min(key_count, len(keys))
     return KeyState(modifiers=modifiers, keys=tuple(k for k in keys[:key_count] if k))
 
