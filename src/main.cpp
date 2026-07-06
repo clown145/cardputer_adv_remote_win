@@ -101,6 +101,7 @@ uint32_t lastConnectAttemptAt = 0;
 uint32_t lastStatusAt = 0;
 uint32_t lastMouseReportAt = 0;
 uint32_t lastMouseWheelAt = 0;
+uint32_t modeBadgeUntil = 0;
 uint8_t lastMouseButtons = 0;
 bool hadFrame = false;
 bool mouseMode = false;
@@ -640,7 +641,7 @@ void ensureConnections() {
 }
 
 void drawModeBadge() {
-    if ((!mouseMode && !gameMode) || !hadFrame) {
+    if ((!mouseMode && !gameMode) || !hadFrame || millis() > modeBadgeUntil) {
         return;
     }
     const char* label = gameMode ? "GAME" : "MOUSE";
@@ -852,6 +853,7 @@ void setMouseMode(bool enabled) {
     mouseMode = enabled;
     if (enabled) {
         gameMode = false;
+        modeBadgeUntil = millis() + 1000;
     }
     resetMouseRuntimeState();
     sendKeyboardReleaseReport();
@@ -873,6 +875,7 @@ void setGameMode(bool enabled) {
     gameMode = enabled;
     if (enabled) {
         mouseMode = false;
+        modeBadgeUntil = millis() + 1000;
     }
     resetMouseRuntimeState();
     sendKeyboardReleaseReport();

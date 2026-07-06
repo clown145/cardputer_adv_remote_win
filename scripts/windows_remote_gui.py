@@ -138,7 +138,7 @@ class RemoteGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Cardputer-Adv Remote")
-        self.minsize(760, 560)
+        self.minsize(760, 620)
 
         self.settings = load_settings()
         self.log_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
@@ -167,6 +167,9 @@ class RemoteGui(tk.Tk):
         self.quality_var = tk.StringVar(value=str(self.settings.get("quality_filter", DEFAULT_CONFIG["quality_filter"])))
         self.backend_var = tk.StringVar(value=str(self.settings.get("input_backend", DEFAULT_CONFIG["input_backend"])))
         self.timeout_var = tk.StringVar(value=self._format_float(self.settings.get("input_timeout", DEFAULT_CONFIG["input_timeout"])))
+        self.mouse_hz_var = tk.StringVar(value=self._format_float(self.settings.get("mouse_pump_hz", DEFAULT_CONFIG["mouse_pump_hz"])))
+        self.mouse_hold_var = tk.StringVar(value=self._format_float(self.settings.get("mouse_hold_ms", DEFAULT_CONFIG["mouse_hold_ms"])))
+        self.mouse_scale_var = tk.StringVar(value=self._format_float(self.settings.get("mouse_scale", DEFAULT_CONFIG["mouse_scale"])))
         self.status_var = tk.StringVar(value="Stopped")
         self.admin_var = tk.StringVar(value=f"Admin: {'yes' if is_admin() else 'no'}")
 
@@ -218,9 +221,12 @@ class RemoteGui(tk.Tk):
         self._spin(network, "Input port", self.input_port_var, 1, 65535, 1, 3)
         self._combo(network, "Input", self.backend_var, list(INPUT_BACKEND_CHOICES), 4)
         self._spin(network, "Timeout", self.timeout_var, 1, 30, 0.5, 5)
+        self._spin(network, "Mouse Hz", self.mouse_hz_var, 30, 240, 10, 6)
+        self._spin(network, "Hold ms", self.mouse_hold_var, 20, 200, 5, 7)
+        self._spin(network, "Mouse scale", self.mouse_scale_var, 0.1, 5.0, 0.1, 8)
 
         buttons = ttk.Frame(network)
-        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", padx=8, pady=(10, 8))
+        buttons.grid(row=9, column=0, columnspan=2, sticky="ew", padx=8, pady=(10, 8))
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(buttons, text="Start", command=self._start)
@@ -303,6 +309,9 @@ class RemoteGui(tk.Tk):
             "quality_filter": self.quality_var.get(),
             "input_timeout": self._float_value(self.timeout_var, "Timeout", 0.5, 120.0),
             "input_backend": self.backend_var.get(),
+            "mouse_pump_hz": self._float_value(self.mouse_hz_var, "Mouse Hz", 1.0, 500.0),
+            "mouse_hold_ms": self._float_value(self.mouse_hold_var, "Hold ms", 1.0, 1000.0),
+            "mouse_scale": self._float_value(self.mouse_scale_var, "Mouse scale", 0.05, 20.0),
             "no_admin_relaunch": False,
         }
 

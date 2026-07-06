@@ -48,6 +48,9 @@ DEFAULT_CONFIG = {
     "quality_filter": "bilinear",
     "input_timeout": 4.0,
     "input_backend": "win32",
+    "mouse_pump_hz": 120.0,
+    "mouse_hold_ms": 70.0,
+    "mouse_scale": 1.0,
     "no_admin_relaunch": False,
 }
 
@@ -351,6 +354,9 @@ class InputBridge:
         self.keyboard.release_all()
         self.mouse.release_all()
 
+    def close(self) -> None:
+        self.release_all()
+
 
 WORD = ctypes.c_uint16
 DWORD = ctypes.c_uint32
@@ -420,6 +426,8 @@ class Win32SendInput:
     MOUSEEVENTF_MIDDLEUP = 0x0040
     MOUSEEVENTF_WHEEL = 0x0800
     WHEEL_DELTA = 120
+    DF_ALLOWOTHERACCOUNTHOOK = 0x0001
+    GENERIC_ALL = 0x10000000
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -427,6 +435,14 @@ class Win32SendInput:
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.user32.SendInput.argtypes = (UINT, ctypes.POINTER(INPUT), ctypes.c_int)
         self.user32.SendInput.restype = UINT
+        self.user32.OpenInputDesktop.argtypes = (DWORD, ctypes.c_bool, DWORD)
+        self.user32.OpenInputDesktop.restype = ctypes.c_void_p
+        self.user32.SetThreadDesktop.argtypes = (ctypes.c_void_p,)
+        self.user32.SetThreadDesktop.restype = ctypes.c_bool
+        self.user32.CloseDesktop.argtypes = (ctypes.c_void_p,)
+        self.user32.CloseDesktop.restype = ctypes.c_bool
+        self.thread_state = threading.local()
+        self.send_lock = threading.Lock()
 
     def key(self, scan_code: int, down: bool, extended: bool = False) -> None:
         flags = self.KEYEVENTF_SCANCODE
@@ -448,9 +464,33 @@ class Win32SendInput:
         self._send(event)
 
     def _send(self, event: INPUT) -> None:
-        sent = self.user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event))
-        if sent != 1:
-            raise ctypes.WinError(ctypes.get_last_error())
+        with self.send_lock:
+            for attempt in range(2):
+                sent = self.user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(event))
+                if sent == 1:
+                    return
+
+                error = ctypes.get_last_error()
+                desktop = self._sync_thread_desktop()
+                previous = getattr(self.thread_state, "desktop", None)
+                if attempt == 0 and desktop and desktop != previous:
+                    self.thread_state.desktop = desktop
+                    continue
+                raise ctypes.WinError(error)
+
+    def _sync_thread_desktop(self) -> int:
+        desktop = self.user32.OpenInputDesktop(self.DF_ALLOWOTHERACCOUNTHOOK, False, self.GENERIC_ALL)
+        if not desktop:
+            error = ctypes.get_last_error()
+            print(f"INPUT: OpenInputDesktop failed ({error})", flush=True)
+            return 0
+
+        value = int(desktop)
+        if not self.user32.SetThreadDesktop(desktop):
+            error = ctypes.get_last_error()
+            print(f"INPUT: SetThreadDesktop failed ({error})", flush=True)
+        self.user32.CloseDesktop(desktop)
+        return value
 
 
 class Win32KeyboardBridge:
@@ -503,11 +543,21 @@ class Win32MouseBridge:
         2: (Win32SendInput.MOUSEEVENTF_MIDDLEDOWN, Win32SendInput.MOUSEEVENTF_MIDDLEUP),
     }
 
-    def __init__(self, sender: Win32SendInput, mode_active: threading.Event) -> None:
+    def __init__(self, sender: Win32SendInput, mode_active: threading.Event, args: argparse.Namespace) -> None:
         self.sender = sender
         self.mode_active = mode_active
         self.current_buttons: set[int] = set()
         self.lock = threading.Lock()
+        self.velocity_lock = threading.Lock()
+        self.velocity_dx = 0
+        self.velocity_dy = 0
+        self.velocity_until = 0.0
+        self.pump_interval = 1.0 / max(float(args.mouse_pump_hz), 1.0)
+        self.hold_seconds = max(float(args.mouse_hold_ms), 1.0) / 1000.0
+        self.mouse_scale = max(float(args.mouse_scale), 0.05)
+        self.stop_event = threading.Event()
+        self.pump_thread = threading.Thread(target=self._pump_mouse_moves, daemon=True)
+        self.pump_thread.start()
 
     def apply(self, state: MouseState) -> None:
         if not state.active:
@@ -528,23 +578,67 @@ class Win32MouseBridge:
             self.current_buttons = target_buttons
 
             if state.dx or state.dy:
-                self.sender.mouse(self.sender.MOUSEEVENTF_MOVE, dx=state.dx, dy=state.dy)
+                if state.crosshair:
+                    self.sender.mouse(self.sender.MOUSEEVENTF_MOVE, dx=state.dx, dy=state.dy)
+                else:
+                    self._set_velocity(state.dx, state.dy)
             if state.wheel:
                 self.sender.mouse(self.sender.MOUSEEVENTF_WHEEL, data=state.wheel * self.sender.WHEEL_DELTA)
 
     def release_all(self) -> None:
         self.mode_active.clear()
+        self._clear_velocity()
         with self.lock:
             for bit in list(self.current_buttons):
                 self.sender.mouse(self.BUTTON_EVENTS[bit][1])
             self.current_buttons.clear()
 
+    def close(self) -> None:
+        self.stop_event.set()
+        self.release_all()
+        self.pump_thread.join(timeout=1.0)
+
+    def _set_velocity(self, dx: int, dy: int) -> None:
+        with self.velocity_lock:
+            self.velocity_dx = dx
+            self.velocity_dy = dy
+            self.velocity_until = time.perf_counter() + self.hold_seconds
+
+    def _clear_velocity(self) -> None:
+        with self.velocity_lock:
+            self.velocity_dx = 0
+            self.velocity_dy = 0
+            self.velocity_until = 0.0
+
+    def _pump_mouse_moves(self) -> None:
+        while not self.stop_event.wait(self.pump_interval):
+            with self.velocity_lock:
+                if time.perf_counter() > self.velocity_until:
+                    self.velocity_dx = 0
+                    self.velocity_dy = 0
+                dx = self._scaled_delta(self.velocity_dx)
+                dy = self._scaled_delta(self.velocity_dy)
+            if dx or dy:
+                try:
+                    self.sender.mouse(self.sender.MOUSEEVENTF_MOVE, dx=dx, dy=dy)
+                except OSError as exc:
+                    print(f"INPUT: mouse pump failed ({exc})", flush=True)
+                    self._clear_velocity()
+
+    def _scaled_delta(self, value: int) -> int:
+        if value == 0:
+            return 0
+        scaled = int(round(value * self.mouse_scale))
+        if scaled == 0:
+            return 1 if value > 0 else -1
+        return scaled
+
 
 class Win32InputBridge:
-    def __init__(self, mouse_mode_active: threading.Event) -> None:
+    def __init__(self, mouse_mode_active: threading.Event, args: argparse.Namespace) -> None:
         sender = Win32SendInput()
         self.keyboard = Win32KeyboardBridge(sender)
-        self.mouse = Win32MouseBridge(sender, mouse_mode_active)
+        self.mouse = Win32MouseBridge(sender, mouse_mode_active, args)
 
     def apply(self, state: KeyState | MouseState) -> None:
         if isinstance(state, KeyState):
@@ -555,6 +649,10 @@ class Win32InputBridge:
     def release_all(self) -> None:
         self.keyboard.release_all()
         self.mouse.release_all()
+
+    def close(self) -> None:
+        self.keyboard.release_all()
+        self.mouse.close()
 
 
 def make_server_args(**overrides: object) -> argparse.Namespace:
@@ -575,6 +673,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality-filter", choices=QUALITY_FILTER_CHOICES, default=DEFAULT_CONFIG["quality_filter"])
     parser.add_argument("--input-timeout", type=float, default=DEFAULT_CONFIG["input_timeout"], help="Seconds without input reports before reconnect.")
     parser.add_argument("--input-backend", choices=INPUT_BACKEND_CHOICES, default=DEFAULT_CONFIG["input_backend"])
+    parser.add_argument("--mouse-pump-hz", type=float, default=DEFAULT_CONFIG["mouse_pump_hz"], help="Hidden-crosshair mouse pump rate for game mode.")
+    parser.add_argument("--mouse-hold-ms", type=float, default=DEFAULT_CONFIG["mouse_hold_ms"], help="How long each game mouse delta is replayed.")
+    parser.add_argument("--mouse-scale", type=float, default=DEFAULT_CONFIG["mouse_scale"], help="Multiplier for game mouse deltas.")
     parser.add_argument("--no-admin-relaunch", action="store_true", help="Do not relaunch through UAC on Windows.")
     return parser.parse_args()
 
@@ -839,7 +940,7 @@ def input_server(args: argparse.Namespace, bridge: InputBridge | Win32InputBridg
 
 def create_input_bridge(args: argparse.Namespace, mouse_mode_active: threading.Event) -> InputBridge | Win32InputBridge:
     if args.input_backend == "win32":
-        return Win32InputBridge(mouse_mode_active)
+        return Win32InputBridge(mouse_mode_active, args)
     return InputBridge(mouse_mode_active)
 
 
@@ -854,6 +955,7 @@ def run_server(args: argparse.Namespace, stop: threading.Event | None = None) ->
     print(f"Monitor: {args.monitor}")
     print(f"Quality filter: {args.quality_filter}")
     print(f"Input backend: {args.input_backend}")
+    print(f"Game mouse: {args.mouse_pump_hz:g} Hz, hold {args.mouse_hold_ms:g} ms, scale {args.mouse_scale:g}")
     print(f"Administrator: {'yes' if is_admin() else 'no'}")
     print("Tip: run as Administrator if you need to control elevated windows.")
 
@@ -871,7 +973,7 @@ def run_server(args: argparse.Namespace, stop: threading.Event | None = None) ->
         print("\nStopping...", flush=True)
     finally:
         stop.set()
-        bridge.release_all()
+        bridge.close()
         for thread in threads:
             thread.join(timeout=1.0)
 

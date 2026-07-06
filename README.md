@@ -55,6 +55,8 @@ Setup steps:
 
 If you use the GitHub Actions build artifact, download `windows-exes` and run `cardputer_adv_remote_win.exe`. It is built with an administrator manifest, so Windows should show a UAC prompt when it starts. The GUI can adjust stream mode, FPS, monitor, scaling filter, ports, and input backend. Click `Start` after choosing the settings.
 
+The `Mouse Hz`, `Hold ms`, and `Mouse scale` controls tune the hidden-crosshair game mouse pump. They only affect game mode mouse-look, not normal mouse mode.
+
 The GUI saves settings in the user config folder, for example `%APPDATA%\CardputerAdvRemote\settings.json`, not beside the exe and not in the repo root. It also shows the PC LAN IPv4 address to enter on the Cardputer setup screen.
 
 The console build is still available as `cardputer_adv_remote_win_server.exe` for debugging.
@@ -127,6 +129,7 @@ Game mode:
 - `L`: left mouse button.
 - `'`: right mouse button.
 - `Fn+;` / `Fn+.`: scroll up/down.
+- The `GAME`/`MOUSE` corner badge only appears briefly after toggling modes.
 
 ## Troubleshooting
 
