@@ -29,6 +29,7 @@ jobs:
 
       - name: Merge firmware bins
         run: |
+          rm -rf dist
           mkdir -p dist
           python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
             --output dist/cardputer_adv_remote_win_merged.bin \
