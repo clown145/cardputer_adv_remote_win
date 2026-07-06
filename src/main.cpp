@@ -4,7 +4,7 @@
 #include <WiFi.h>
 
 #ifndef OPT_AS_WIN
-#define OPT_AS_WIN 0
+#define OPT_AS_WIN 1
 #endif
 
 namespace {
@@ -726,9 +726,12 @@ uint8_t remapGameKey(uint8_t key) {
     return key;
 }
 
-bool suppressGameKeyboardKey(uint8_t key, bool suppressToggleKey) {
+bool suppressGameKeyboardKey(uint8_t key, bool suppressToggleKey, bool fnHeld) {
     if (suppressToggleKey && key == kHidG) {
         return true;
+    }
+    if (fnHeld && (key == kHidL || key == kHidApostrophe)) {
+        return false;
     }
     switch (key) {
         case kHidL:
@@ -745,6 +748,18 @@ bool suppressGameKeyboardKey(uint8_t key, bool suppressToggleKey) {
         default:
             return false;
     }
+}
+
+void addKeyboardReportKey(InputReport& report, uint8_t& index, uint8_t key) {
+    if (index >= kMaxHidKeys) {
+        return;
+    }
+    for (uint8_t i = 0; i < index; ++i) {
+        if (report.keys[i] == key) {
+            return;
+        }
+    }
+    report.keys[index++] = key;
 }
 
 InputReport buildKeyboardReport() {
@@ -767,12 +782,20 @@ InputReport buildKeyboardReport() {
             continue;
         }
         if (gameMode) {
-            if (suppressGameKeyboardKey(key, gameTogglePressed())) {
+            if (suppressGameKeyboardKey(key, gameTogglePressed(), state.fn)) {
                 continue;
             }
-            report.keys[index++] = remapGameKey(key);
+            addKeyboardReportKey(report, index, remapGameKey(key));
         } else {
-            report.keys[index++] = key;
+            addKeyboardReportKey(report, index, key);
+        }
+    }
+    if (gameMode && state.fn) {
+        if (keyPressed('l', 'L')) {
+            addKeyboardReportKey(report, index, kHidL);
+        }
+        if (keyPressed('\'', '"')) {
+            addKeyboardReportKey(report, index, kHidApostrophe);
         }
     }
     report.key_count = index;
@@ -969,10 +992,10 @@ void processGameInput() {
     const uint32_t now = millis();
 
     uint8_t buttons = 0;
-    if (keyPressed('l', 'L')) {
+    if (!state.fn && keyPressed('l', 'L')) {
         buttons |= kMouseButtonLeft;
     }
-    if (keyPressed('\'', '"')) {
+    if (!state.fn && keyPressed('\'', '"')) {
         buttons |= kMouseButtonRight;
     }
 

@@ -53,13 +53,11 @@ Setup steps:
 
 ## Windows Setup
 
-If you use the GitHub Actions build artifact, download `windows-exes` and run `cardputer_adv_remote_win.exe`. It is built with an administrator manifest, so Windows should show a UAC prompt when it starts. The GUI can adjust stream mode, FPS, monitor, scaling filter, ports, and input backend. Click `Start` after choosing the settings.
+If you use the GitHub Actions build artifact, download `windows-gui-exe` and run `cardputer_adv_remote_win.exe`. It is built with an administrator manifest, so Windows should show a UAC prompt when it starts. The GUI can adjust stream mode, FPS, monitor, scaling filter, ports, and input backend. Click `Start` after choosing the settings.
 
 The `Mouse Hz`, `Hold ms`, and `Mouse scale` controls tune the hidden-crosshair game mouse pump. They only affect game mode mouse-look, not normal mouse mode.
 
 The GUI saves settings in the user config folder, for example `%APPDATA%\CardputerAdvRemote\settings.json`, not beside the exe and not in the repo root. It also shows the PC LAN IPv4 address to enter on the Cardputer setup screen.
-
-The console build is still available as `cardputer_adv_remote_win_server.exe` for debugging.
 
 Run these commands in PowerShell on the Windows PC:
 
@@ -97,8 +95,8 @@ While mouse mode is active, the Windows server draws the current mouse position 
 
 The `Build` workflow produces two downloadable artifacts:
 
-- `firmware-bins`: merged `0x0` flashable firmware images plus SHA-256 checksums.
-- `windows-exes`: a one-file GUI exe and a one-file console server exe built with PyInstaller and UAC administrator prompt enabled.
+- `firmware-bin`: one merged `0x0` flashable firmware image plus SHA-256 checksums.
+- `windows-gui-exe`: one GUI exe built with PyInstaller and UAC administrator prompt enabled.
 
 ## Wi-Fi Behavior
 
@@ -111,7 +109,7 @@ Most physical keys are sent as USB HID-style keyboard reports:
 - Regular letters, numbers, punctuation, Space, Tab, Enter, Backspace.
 - `Fn` layer for arrows, Escape, Delete, and F1-F12 as exposed by the M5Cardputer library. On Cardputer-Adv, `Fn+;`, `Fn+,`, `Fn+.`, and `Fn+/` are up/left/down/right.
 - Ctrl, Shift, and Alt modifiers are preserved.
-- The `cardputer_adv_opt_win` firmware build maps `Opt` to the Windows key.
+- `Opt` maps to the Windows key by default.
 
 Mouse mode:
 
@@ -128,6 +126,7 @@ Game mode:
 - `;` / `.` / `,` / `/` and the arrow layer control mouse-look.
 - `L`: left mouse button.
 - `'`: right mouse button.
+- `Fn+L` / `Fn+'`: send literal `L` / `'` keyboard keys.
 - `Fn+;` / `Fn+.`: scroll up/down.
 - The `GAME`/`MOUSE` corner badge only appears briefly after toggling modes.
 

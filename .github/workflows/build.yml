@@ -9,7 +9,7 @@ on:
 
 jobs:
   firmware:
-    name: Firmware bins
+    name: Firmware bin
     runs-on: ubuntu-latest
 
     steps:
@@ -25,7 +25,7 @@ jobs:
         run: python -m pip install --upgrade platformio
 
       - name: Build firmware
-        run: pio run -e cardputer_adv -e cardputer_adv_opt_win
+        run: pio run -e cardputer_adv
 
       - name: Merge firmware bins
         run: |
@@ -37,13 +37,6 @@ jobs:
             0x8000 .pio/build/cardputer_adv/partitions.bin \
             0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
             0x10000 .pio/build/cardputer_adv/firmware.bin
-          python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
-            --output dist/cardputer_adv_remote_win_opt_as_win_merged.bin \
-            --flash_mode keep --flash_freq keep --flash_size keep \
-            0x0 .pio/build/cardputer_adv_opt_win/bootloader.bin \
-            0x8000 .pio/build/cardputer_adv_opt_win/partitions.bin \
-            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
-            0x10000 .pio/build/cardputer_adv_opt_win/firmware.bin
 
       - name: Checksums
         run: sha256sum dist/*.bin | tee dist/SHA256SUMS.txt
@@ -51,13 +44,13 @@ jobs:
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-bins
+          name: firmware-bin
           path: |
             dist/*.bin
             dist/SHA256SUMS.txt
 
   windows-exe:
-    name: Windows exes
+    name: Windows GUI exe
     runs-on: windows-latest
 
     steps:
@@ -71,17 +64,6 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install --upgrade pyinstaller -r scripts\requirements-windows.txt
-
-      - name: Build console server exe
-        run: >
-          python -m PyInstaller
-          --clean
-          --noconfirm
-          --onefile
-          --console
-          --uac-admin
-          --name cardputer_adv_remote_win_server
-          scripts\windows_remote_server.py
 
       - name: Build GUI exe
         run: >
@@ -108,7 +90,7 @@ jobs:
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-exes
+          name: windows-gui-exe
           path: |
             dist/*.exe
             dist/SHA256SUMS.txt
