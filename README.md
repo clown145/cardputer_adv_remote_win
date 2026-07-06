@@ -1,6 +1,6 @@
 # Cardputer-Adv Windows Remote
 
-[Chinese documentation](README.zh-CN.md)
+[中文文档](README.zh-CN.md)
 
 Native firmware and a Windows GUI bridge for using an M5Stack Cardputer-Adv as a tiny Wi-Fi remote controller for a Windows PC.
 
@@ -123,17 +123,6 @@ Hidden-crosshair mouse-look mode. Use `Input = win32`; run the Windows GUI as Ad
 | `'` | Right mouse button |
 | `Fn+L` / `Fn+'` | Send keyboard `L` / `'` |
 | `Fn+;` / `Fn+.` | Scroll up / down |
-
-## Release
-
-Create a tag to publish a release:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-The `Release` workflow uploads the exe, firmware bin, and their `.sha256` files directly to the GitHub Release. It does not attach zip files.
 
 ## License
 

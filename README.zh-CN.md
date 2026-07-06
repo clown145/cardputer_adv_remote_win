@@ -124,17 +124,6 @@ python scripts\windows_remote_server.py --width 240 --height 135 --fps 6 --input
 | `Fn+L` / `Fn+'` | 发送键盘 `L` / `'` |
 | `Fn+;` / `Fn+.` | 向上 / 向下滚轮 |
 
-## 发版
-
-推 tag 会发版：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-`Release` 工作流会把 exe、固件 bin 和它们的 `.sha256` 直接传到 GitHub Release，不上传 zip。
-
 ## 协议
 
 GPL-3.0。见 [LICENSE](LICENSE)。
