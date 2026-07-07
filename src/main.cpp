@@ -1,6 +1,8 @@
 #include <Arduino.h>
+#include <ctype.h>
 #include <M5Cardputer.h>
 #include <Preferences.h>
+#include <WiFiUdp.h>
 #include <WiFi.h>
 
 #ifndef OPT_AS_WIN
@@ -16,10 +18,19 @@ constexpr uint16_t kFrameHeight = 135;
 constexpr uint32_t kConnectRetryMs = 3000;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint32_t kMenuBootWindowMs = 1800;
+constexpr uint16_t kDiscoveryPort = 5052;
+constexpr uint16_t kDiscoveryProtocolVersion = 1;
+constexpr uint32_t kDiscoveryBroadcastMs = 2000;
 constexpr uint32_t kMagic = 0x41575243;  // "CRWA" little endian
 constexpr uint16_t kFrameProtocolVersion = 1;
 constexpr uint16_t kInputProtocolVersion = 2;
 constexpr size_t kFrameBytes = kFrameWidth * kFrameHeight * sizeof(uint16_t);
+constexpr uint16_t kFrameFormatRgb565 = 1;
+constexpr uint16_t kFrameFormatTileDelta = 2;
+constexpr uint16_t kTileWidth = 16;
+constexpr uint16_t kTileHeight = 15;
+constexpr uint16_t kFullRedrawTileThreshold = 48;
+constexpr size_t kMaxTileBytes = kTileWidth * kTileHeight * sizeof(uint16_t);
 constexpr uint32_t kStatusRedrawMs = 1000;
 constexpr uint32_t kFrameTimeoutMs = 2500;
 constexpr uint32_t kInputKeepaliveMs = 1000;
@@ -65,7 +76,7 @@ struct RuntimeConfig {
     }
 
     bool complete() const {
-        return hasWifi() && hasHost();
+        return hasWifi();
     }
 };
 
@@ -79,6 +90,18 @@ struct __attribute__((packed)) FrameHeader {
     uint32_t payload_len;
 };
 
+struct __attribute__((packed)) TileDeltaHeader {
+    uint16_t tile_count;
+    uint16_t reserved;
+};
+
+struct __attribute__((packed)) TileHeader {
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+};
+
 struct __attribute__((packed)) InputReport {
     uint32_t magic;
     uint16_t version;
@@ -90,9 +113,11 @@ struct __attribute__((packed)) InputReport {
 
 WiFiClient frameClient;
 WiFiClient inputClient;
+WiFiUDP discoveryUdp;
 
 RuntimeConfig appConfig;
 uint16_t frameBuffer[kFrameWidth * kFrameHeight];
+uint16_t tileBuffer[kTileWidth * kTileHeight];
 uint16_t lastSequence = 0;
 uint32_t lastFrameId = 0;
 uint32_t lastFrameAt = 0;
@@ -101,7 +126,10 @@ uint32_t lastConnectAttemptAt = 0;
 uint32_t lastStatusAt = 0;
 uint32_t lastMouseReportAt = 0;
 uint32_t lastMouseWheelAt = 0;
+uint32_t lastDiscoveryBroadcastAt = 0;
+bool discoveryBroadcastPrimed = false;
 uint32_t modeBadgeUntil = 0;
+bool discoveryUdpReady = false;
 uint8_t lastMouseButtons = 0;
 bool hadFrame = false;
 bool mouseMode = false;
@@ -111,6 +139,9 @@ bool gameToggleHeld = false;
 bool inputJustConnected = false;
 
 InputReport lastReport = {};
+
+bool keyPressed(char normal, char shifted);
+const char* hostStatusText();
 
 void drawStatus(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr) {
     auto& display = M5Cardputer.Display;
@@ -135,7 +166,7 @@ void drawStatus(const char* line1, const char* line2 = nullptr, const char* line
     if (WiFi.isConnected()) {
         display.printf("SSID: %s\n", WiFi.SSID().c_str());
     }
-    display.printf("Host: %s\n", appConfig.host.length() ? appConfig.host.c_str() : "not set");
+    display.printf("Host: %s\n", hostStatusText());
     display.printf("Mode: %s\n", gameMode ? "game" : (mouseMode ? "mouse" : "keyboard"));
     display.printf("Frames: %lu\n", static_cast<unsigned long>(lastFrameId));
 }
@@ -157,6 +188,8 @@ struct KeySnapshot {
     bool right = false;
     char chars[8] = {};
     uint8_t charCount = 0;
+    char physicalChars[8] = {};
+    uint8_t physicalCharCount = 0;
 
     bool hasAction() const {
         return enter || backspace || esc || up || left || down || right || charCount > 0;
@@ -170,22 +203,33 @@ struct KeySnapshot {
         }
         return false;
     }
+
+    bool hasPhysicalChar(char target) const {
+        const char normalizedTarget = static_cast<char>(tolower(static_cast<unsigned char>(target)));
+        for (uint8_t i = 0; i < physicalCharCount; ++i) {
+            const char current = static_cast<char>(tolower(static_cast<unsigned char>(physicalChars[i])));
+            if (current == normalizedTarget) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 bool navUp(const KeySnapshot& key) {
-    return key.up || key.hasChar(';');
+    return key.up || key.hasPhysicalChar(';') || key.hasPhysicalChar('w');
 }
 
 bool navLeft(const KeySnapshot& key) {
-    return key.left || key.hasChar(',');
+    return key.left || key.hasPhysicalChar(',') || key.hasPhysicalChar('a');
 }
 
 bool navDown(const KeySnapshot& key) {
-    return key.down || key.hasChar('.');
+    return key.down || key.hasPhysicalChar('.') || key.hasPhysicalChar('s');
 }
 
 bool navRight(const KeySnapshot& key) {
-    return key.right || key.hasChar('/');
+    return key.right || key.hasPhysicalChar('/') || key.hasPhysicalChar('d');
 }
 
 KeySnapshot waitKeyPress() {
@@ -208,6 +252,15 @@ KeySnapshot waitKeyPress() {
                 }
                 if (c >= 32 && c <= 126) {
                     key.chars[key.charCount++] = c;
+                }
+            }
+            for (const auto& pos : M5Cardputer.Keyboard.keyList()) {
+                if (key.physicalCharCount >= sizeof(key.physicalChars)) {
+                    break;
+                }
+                const char c = M5Cardputer.Keyboard.getKeyValue(pos).value_first;
+                if (c >= 32 && c <= 126) {
+                    key.physicalChars[key.physicalCharCount++] = c;
                 }
             }
             if (key.hasAction()) {
@@ -313,6 +366,10 @@ void saveRuntimeConfig() {
     prefs.end();
 }
 
+const char* hostStatusText() {
+    return appConfig.host.length() ? appConfig.host.c_str() : "auto";
+}
+
 void clearRuntimeConfig() {
     Preferences prefs;
     if (prefs.begin(kConfigNamespace, false)) {
@@ -407,6 +464,133 @@ bool connectConfiguredWifi() {
     return connectWifiCredential(appConfig.ssid.c_str(), appConfig.password.c_str(), "Saved");
 }
 
+void resetDiscoverySocket() {
+    if (discoveryUdpReady) {
+        discoveryUdp.stop();
+        discoveryUdpReady = false;
+    }
+    lastDiscoveryBroadcastAt = 0;
+    discoveryBroadcastPrimed = false;
+}
+
+IPAddress discoveryBroadcastAddress() {
+    IPAddress local = WiFi.localIP();
+    IPAddress mask = WiFi.subnetMask();
+    return IPAddress(local[0] | static_cast<uint8_t>(~mask[0]), local[1] | static_cast<uint8_t>(~mask[1]),
+                     local[2] | static_cast<uint8_t>(~mask[2]), local[3] | static_cast<uint8_t>(~mask[3]));
+}
+
+bool sendDiscoveryPacketTo(const IPAddress& address, const char* payload) {
+    const size_t payloadLen = strlen(payload);
+    if (!discoveryUdp.beginPacket(address, kDiscoveryPort)) {
+        return false;
+    }
+    if (discoveryUdp.write(reinterpret_cast<const uint8_t*>(payload), payloadLen) != payloadLen) {
+        discoveryUdp.endPacket();
+        return false;
+    }
+    return discoveryUdp.endPacket();
+}
+
+bool handleDiscoveryOffer(const char* packet, const IPAddress& sender) {
+    char magic[24] = {};
+    char kind[16] = {};
+    unsigned int version = 0;
+    unsigned int width = 0;
+    unsigned int height = 0;
+    unsigned int framePort = 0;
+    unsigned int inputPort = 0;
+    const int matched = sscanf(packet, "%23s %15s %u %u %u %u %u", magic, kind, &version, &width, &height,
+                               &framePort, &inputPort);
+    if (matched < 7 || strcmp(magic, "CARDPUTER_REMOTE") != 0 || strcmp(kind, "HOST") != 0 ||
+        version != kDiscoveryProtocolVersion || width != kFrameWidth || height != kFrameHeight || framePort == 0 ||
+        inputPort == 0) {
+        return false;
+    }
+
+    const String discoveredHost = sender.toString();
+    const bool changed = discoveredHost != appConfig.host || appConfig.framePort != framePort ||
+                         appConfig.inputPort != inputPort;
+    if (!changed) {
+        return true;
+    }
+
+    appConfig.host = discoveredHost;
+    appConfig.framePort = static_cast<uint16_t>(framePort);
+    appConfig.inputPort = static_cast<uint16_t>(inputPort);
+    saveRuntimeConfig();
+    frameClient.stop();
+    inputClient.stop();
+    lastConnectAttemptAt = 0;
+    drawStatus("Host discovered", hostStatusText(), "Connecting...");
+    return true;
+}
+
+bool handleDiscoveryProbe(const char* packet, const IPAddress& sender) {
+    char magic[24] = {};
+    char kind[16] = {};
+    unsigned int version = 0;
+    unsigned int width = 0;
+    unsigned int height = 0;
+    const int matched = sscanf(packet, "%23s %15s %u %u %u", magic, kind, &version, &width, &height);
+    if (matched < 5 || strcmp(magic, "CARDPUTER_REMOTE") != 0 || strcmp(kind, "DISCOVER") != 0 ||
+        version != kDiscoveryProtocolVersion || width != kFrameWidth || height != kFrameHeight) {
+        return false;
+    }
+
+    char response[96];
+    const int written = snprintf(response, sizeof(response), "CARDPUTER_REMOTE ADV %u %u %u\n",
+                                 kDiscoveryProtocolVersion, kFrameWidth, kFrameHeight);
+    return written > 0 && sendDiscoveryPacketTo(sender, response);
+}
+
+bool pollHostDiscovery() {
+    if (!WiFi.isConnected()) {
+        resetDiscoverySocket();
+        return false;
+    }
+
+    if (!discoveryUdpReady) {
+        discoveryUdpReady = discoveryUdp.begin(kDiscoveryPort);
+        if (!discoveryUdpReady) {
+            return false;
+        }
+    }
+
+    const uint32_t now = millis();
+    if (!discoveryBroadcastPrimed || now - lastDiscoveryBroadcastAt >= kDiscoveryBroadcastMs) {
+        char packet[96];
+        const int written = snprintf(packet, sizeof(packet), "CARDPUTER_REMOTE ADV %u %u %u\n",
+                                     kDiscoveryProtocolVersion, kFrameWidth, kFrameHeight);
+        if (written > 0) {
+            const IPAddress broadcast(255, 255, 255, 255);
+            const IPAddress subnetBroadcast = discoveryBroadcastAddress();
+            sendDiscoveryPacketTo(broadcast, packet);
+            if (subnetBroadcast != broadcast) {
+                sendDiscoveryPacketTo(subnetBroadcast, packet);
+            }
+        }
+        lastDiscoveryBroadcastAt = now;
+        discoveryBroadcastPrimed = true;
+    }
+
+    bool found = false;
+    int packetSize = discoveryUdp.parsePacket();
+    while (packetSize > 0) {
+        char packet[160];
+        const int bytes = discoveryUdp.read(reinterpret_cast<uint8_t*>(packet),
+                                            min(packetSize, static_cast<int>(sizeof(packet) - 1)));
+        if (bytes > 0) {
+            packet[bytes] = '\0';
+            const IPAddress sender = discoveryUdp.remoteIP();
+            found |= handleDiscoveryProbe(packet, sender);
+            found |= handleDiscoveryOffer(packet, sender);
+        }
+        packetSize = discoveryUdp.parsePacket();
+    }
+    return found;
+}
+
 int selectScannedWifi(int networkCount) {
     int selected = 0;
     while (true) {
@@ -418,7 +602,7 @@ int selectScannedWifi(int networkCount) {
         display.setTextColor(TFT_GREEN, TFT_BLACK);
         display.println("Select WiFi");
         display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        display.println(";/. or arrows, Enter");
+        display.println("W/S/A/D or ;/., Enter");
 
         const int visibleRows = 8;
         int start = selected - visibleRows / 2;
@@ -482,7 +666,7 @@ void configureWifiOnDevice() {
 }
 
 void configureHostOnDevice() {
-    appConfig.host = editText("Windows IP", appConfig.host.length() ? appConfig.host : "192.168.1.", false);
+    appConfig.host = editText("Host IP", appConfig.host.length() ? appConfig.host : "", false);
     saveRuntimeConfig();
 }
 
@@ -505,7 +689,7 @@ void configurePortsOnDevice() {
 void drawConfigMenu(int selected) {
     static const char* items[] = {
         "Scan/select WiFi",
-        "Set Windows IP",
+        "Set Host IP",
         "Set ports",
         "Connect",
         "Clear saved config",
@@ -520,8 +704,9 @@ void drawConfigMenu(int selected) {
     display.println("Setup");
     display.setTextColor(TFT_DARKGREY, TFT_BLACK);
     display.printf("WiFi: %s\n", appConfig.ssid.length() ? appConfig.ssid.c_str() : "not set");
-    display.printf("Host: %s\n", appConfig.host.length() ? appConfig.host.c_str() : "not set");
+    display.printf("Host: %s\n", hostStatusText());
     display.printf("Ports: %u/%u\n", appConfig.framePort, appConfig.inputPort);
+    display.println("W/S/A/D or ;/., move");
 
     for (int i = 0; i < 5; ++i) {
         display.setTextColor(i == selected ? TFT_BLACK : TFT_WHITE, i == selected ? TFT_GREEN : TFT_BLACK);
@@ -549,7 +734,7 @@ void runConfigMenu() {
                 if (appConfig.complete()) {
                     return;
                 }
-                drawPrompt("Not Ready", "Set WiFi and Windows IP");
+                drawPrompt("Not Ready", "Set WiFi first");
             } else if (selected == 4) {
                 clearRuntimeConfig();
                 drawPrompt("Config Cleared", "Setup again to connect");
@@ -559,11 +744,11 @@ void runConfigMenu() {
 }
 
 bool bootSetupRequested() {
-    drawStatus("Hold M for setup", "Auto connect starting...");
+    drawStatus("Hold m for setup", "Auto connect starting...");
     const uint32_t started = millis();
     while (millis() - started < kMenuBootWindowMs) {
         M5Cardputer.update();
-        if (M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed('M')) {
+        if (keyPressed('m', 'M')) {
             waitForKeyRelease();
             return true;
         }
@@ -600,6 +785,18 @@ void ensureConnections() {
         ensureWifi();
     }
 
+    if (!frameClient.connected() || !inputClient.connected() || !appConfig.hasHost()) {
+        pollHostDiscovery();
+    }
+
+    if (!appConfig.hasHost()) {
+        if (millis() - lastStatusAt >= kStatusRedrawMs) {
+            lastStatusAt = millis();
+            drawStatus("Waiting for host discovery", "Desktop app will announce itself");
+        }
+        return;
+    }
+
     if (frameClient.connected() && inputClient.connected()) {
         return;
     }
@@ -633,7 +830,7 @@ void ensureConnections() {
     }
 
     if (!frameClient.connected() || !inputClient.connected()) {
-        drawStatus("Waiting for Windows host", frameClient.connected() ? "Frame: ok" : "Frame: reconnect",
+        drawStatus("Waiting for host", frameClient.connected() ? "Frame: ok" : "Frame: reconnect",
                    inputClient.connected() ? "Input: ok" : "Input: reconnect");
     } else {
         drawStatus("Connected to host", "Waiting for frames...");
@@ -655,17 +852,120 @@ void drawModeBadge() {
     display.print(label);
 }
 
-void drawFrame() {
+int frameDisplayX() {
     const int screenW = M5Cardputer.Display.width();
+    return max(0, (screenW - kFrameWidth) / 2);
+}
+
+int frameDisplayY() {
     const int screenH = M5Cardputer.Display.height();
-    const int x = max(0, (screenW - kFrameWidth) / 2);
-    const int y = max(0, (screenH - kFrameHeight) / 2);
+    return max(0, (screenH - kFrameHeight) / 2);
+}
+
+void drawFrame() {
+    const int x = frameDisplayX();
+    const int y = frameDisplayY();
     const bool oldSwapBytes = M5Cardputer.Display.getSwapBytes();
     M5Cardputer.Display.setSwapBytes(true);
     M5Cardputer.Display.pushImage(x, y, kFrameWidth, kFrameHeight, frameBuffer);
     M5Cardputer.Display.setSwapBytes(oldSwapBytes);
     hadFrame = true;
     drawModeBadge();
+}
+
+void copyTileToFrameBuffer(const TileHeader& tile) {
+    for (uint16_t row = 0; row < tile.height; ++row) {
+        memcpy(frameBuffer + (tile.y + row) * kFrameWidth + tile.x, tileBuffer + row * tile.width,
+               tile.width * sizeof(uint16_t));
+    }
+}
+
+void drawTile(const TileHeader& tile) {
+    M5Cardputer.Display.pushImage(frameDisplayX() + tile.x, frameDisplayY() + tile.y, tile.width, tile.height,
+                                  tileBuffer);
+}
+
+bool validTile(const TileHeader& tile) {
+    if (tile.width == 0 || tile.height == 0 || tile.width > kTileWidth || tile.height > kTileHeight) {
+        return false;
+    }
+    if (tile.x >= kFrameWidth || tile.y >= kFrameHeight) {
+        return false;
+    }
+    return tile.x + tile.width <= kFrameWidth && tile.y + tile.height <= kFrameHeight;
+}
+
+bool processTileDeltaPayload(uint32_t payloadLen) {
+    const uint16_t maxTileCount = ((kFrameWidth + kTileWidth - 1) / kTileWidth) *
+                                  ((kFrameHeight + kTileHeight - 1) / kTileHeight);
+    const uint32_t maxPayloadLen = sizeof(TileDeltaHeader) +
+                                   maxTileCount * (sizeof(TileHeader) + static_cast<uint32_t>(kMaxTileBytes));
+    if (!hadFrame || payloadLen < sizeof(TileDeltaHeader) || payloadLen > maxPayloadLen) {
+        return false;
+    }
+
+    TileDeltaHeader delta = {};
+    if (!readExact(frameClient, reinterpret_cast<uint8_t*>(&delta), sizeof(delta), kFrameTimeoutMs)) {
+        return false;
+    }
+    uint32_t remaining = payloadLen - sizeof(delta);
+    if (delta.tile_count > maxTileCount) {
+        return false;
+    }
+
+    const bool redrawFullFrame = delta.tile_count > kFullRedrawTileThreshold;
+    const bool oldSwapBytes = M5Cardputer.Display.getSwapBytes();
+    if (!redrawFullFrame) {
+        M5Cardputer.Display.setSwapBytes(true);
+    }
+
+    for (uint16_t i = 0; i < delta.tile_count; ++i) {
+        if (remaining < sizeof(TileHeader)) {
+            M5Cardputer.Display.setSwapBytes(oldSwapBytes);
+            return false;
+        }
+        TileHeader tile = {};
+        if (!readExact(frameClient, reinterpret_cast<uint8_t*>(&tile), sizeof(tile), kFrameTimeoutMs)) {
+            M5Cardputer.Display.setSwapBytes(oldSwapBytes);
+            return false;
+        }
+        remaining -= sizeof(tile);
+        if (!validTile(tile)) {
+            M5Cardputer.Display.setSwapBytes(oldSwapBytes);
+            return false;
+        }
+
+        const uint32_t tileBytes = static_cast<uint32_t>(tile.width) * tile.height * sizeof(uint16_t);
+        if (tileBytes > kMaxTileBytes || remaining < tileBytes) {
+            M5Cardputer.Display.setSwapBytes(oldSwapBytes);
+            return false;
+        }
+        if (!readExact(frameClient, reinterpret_cast<uint8_t*>(tileBuffer), tileBytes, kFrameTimeoutMs)) {
+            M5Cardputer.Display.setSwapBytes(oldSwapBytes);
+            return false;
+        }
+        remaining -= tileBytes;
+
+        copyTileToFrameBuffer(tile);
+        if (!redrawFullFrame) {
+            drawTile(tile);
+        }
+    }
+
+    if (!redrawFullFrame) {
+        M5Cardputer.Display.setSwapBytes(oldSwapBytes);
+    }
+    if (remaining != 0) {
+        return false;
+    }
+
+    if (redrawFullFrame) {
+        drawFrame();
+    } else {
+        hadFrame = true;
+        drawModeBadge();
+    }
+    return true;
 }
 
 void processFrameStream() {
@@ -680,23 +980,31 @@ void processFrameStream() {
     }
 
     if (header.magic != kMagic || header.version != kFrameProtocolVersion || header.width != kFrameWidth ||
-        header.height != kFrameHeight || header.format != 1 || header.payload_len != kFrameBytes) {
+        header.height != kFrameHeight) {
         drawStatus("Bad frame header", "Check server resolution");
         frameClient.stop();
         return;
     }
 
-    if (!readExact(frameClient, reinterpret_cast<uint8_t*>(frameBuffer), kFrameBytes, kFrameTimeoutMs)) {
+    bool ok = false;
+    if (header.format == kFrameFormatRgb565 && header.payload_len == kFrameBytes) {
+        ok = readExact(frameClient, reinterpret_cast<uint8_t*>(frameBuffer), kFrameBytes, kFrameTimeoutMs);
+        if (ok) {
+            drawFrame();
+        }
+    } else if (header.format == kFrameFormatTileDelta) {
+        ok = processTileDeltaPayload(header.payload_len);
+    }
+
+    if (!ok) {
+        drawStatus("Bad frame payload", "Check server codec");
         frameClient.stop();
         return;
     }
 
     lastFrameId = header.frame_id;
     lastFrameAt = millis();
-    drawFrame();
 }
-
-bool keyPressed(char normal, char shifted);
 
 InputReport makeInputReportBase() {
     InputReport report = {};
@@ -769,7 +1077,7 @@ InputReport buildKeyboardReport() {
     report.modifiers = state.modifiers;
 #if OPT_AS_WIN
     if (state.opt) {
-        report.modifiers |= (1 << 3);  // USB HID left GUI, Windows key on the PC side.
+        report.modifiers |= (1 << 3);  // USB HID left GUI; the host maps it to Win on Windows or Option on macOS.
     }
 #endif
 
@@ -863,7 +1171,13 @@ bool sendMouseReport(int8_t dx, int8_t dy, int8_t wheel, uint8_t buttons, bool a
 }
 
 bool keyPressed(char normal, char shifted) {
-    return M5Cardputer.Keyboard.isKeyPressed(normal) || M5Cardputer.Keyboard.isKeyPressed(shifted);
+    for (const auto& pos : M5Cardputer.Keyboard.keyList()) {
+        const char c = M5Cardputer.Keyboard.getKeyValue(pos).value_first;
+        if (c == normal || c == shifted) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void resetMouseRuntimeState() {

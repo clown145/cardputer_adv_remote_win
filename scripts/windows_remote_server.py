@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows-side capture and input bridge for Cardputer-Adv Remote."""
+"""Desktop-side capture and input bridge for Cardputer-Adv Remote."""
 
 from __future__ import annotations
 
@@ -20,13 +20,23 @@ from mss import mss
 from pynput.keyboard import Controller as KeyboardController, Key
 from pynput.mouse import Button, Controller as MouseController
 
+try:
+    import numpy as np
+except ImportError:  # Keep source check/debug runs usable without the optional fast path installed.
+    np = None
+
 
 MAGIC = 0x41575243  # "CRWA" little endian
 FRAME_VERSION = 1
 INPUT_VERSIONS = {1, 2}
 FORMAT_RGB565 = 1
+FORMAT_TILE_DELTA = 2
 FRAME_HEADER = struct.Struct("<IHHHHII")
+TILE_DELTA_HEADER = struct.Struct("<HH")
+TILE_HEADER = struct.Struct("<HHHH")
 INPUT_REPORT = struct.Struct("<IHHBB6B")
+TILE_WIDTH = 16
+TILE_HEIGHT = 15
 MOUSE_REPORT_FLAG = 0x80
 MOUSE_MODE_ACTIVE = 0x08
 MOUSE_HIDE_CROSSHAIR = 0x10
@@ -37,6 +47,32 @@ MOUSE_BUTTONS = {
 }
 QUALITY_FILTER_CHOICES = ("nearest", "bilinear", "bicubic")
 INPUT_BACKEND_CHOICES = ("win32", "pynput")
+HOST_OS_WINDOWS = "windows"
+HOST_OS_MACOS = "macos"
+HOST_OS_GENERIC = "generic"
+HOST_OS_CHOICES = (HOST_OS_WINDOWS, HOST_OS_MACOS, HOST_OS_GENERIC)
+DISCOVERY_MAGIC = "CARDPUTER_REMOTE"
+DISCOVERY_PORT = 5052
+DISCOVERY_VERSION = 1
+DISCOVERY_BROADCAST_INTERVAL = 2.0
+
+
+def default_host_os() -> str:
+    if sys.platform == "darwin":
+        return HOST_OS_MACOS
+    if os.name == "nt":
+        return HOST_OS_WINDOWS
+    return HOST_OS_GENERIC
+
+
+def default_input_backend() -> str:
+    return "win32" if os.name == "nt" else "pynput"
+
+
+def available_input_backends() -> tuple[str, ...]:
+    return INPUT_BACKEND_CHOICES if os.name == "nt" else ("pynput",)
+
+
 DEFAULT_CONFIG = {
     "bind": "0.0.0.0",
     "frame_port": 5050,
@@ -47,10 +83,12 @@ DEFAULT_CONFIG = {
     "monitor": 1,
     "quality_filter": "bilinear",
     "input_timeout": 4.0,
-    "input_backend": "win32",
+    "host_os": default_host_os(),
+    "input_backend": default_input_backend(),
     "mouse_pump_hz": 120.0,
     "mouse_hold_ms": 70.0,
     "mouse_scale": 1.0,
+    "keyframe_interval": 5.0,
     "no_admin_relaunch": False,
 }
 
@@ -225,15 +263,26 @@ MODIFIER_BITS = {
 }
 MODIFIER_KEYS = frozenset(MODIFIER_BITS.values())
 
+MACOS_MODIFIER_BITS = {
+    **MODIFIER_BITS,
+    3: Key.alt_l,
+    7: Key.alt_r,
+}
+
+
+def pynput_modifier_bits(host_os: str) -> dict[int, object]:
+    if host_os == HOST_OS_MACOS:
+        return MACOS_MODIFIER_BITS
+    return MODIFIER_BITS
+
 @dataclass(frozen=True)
 class KeyState:
     modifiers: int
     keys: tuple[int, ...]
 
-    @property
-    def modifier_objects(self) -> set[object]:
+    def modifier_objects(self, modifier_bits: dict[int, object]) -> set[object]:
         pressed: set[object] = set()
-        for bit, key in MODIFIER_BITS.items():
+        for bit, key in modifier_bits.items():
             if self.modifiers & (1 << bit):
                 pressed.add(key)
         return pressed
@@ -266,19 +315,28 @@ class MouseState:
         return pressed
 
 
+@dataclass(frozen=True)
+class FramePacket:
+    format: int
+    payload: bytes
+    tile_count: int = 0
+
+
 class KeyboardBridge:
-    def __init__(self) -> None:
+    def __init__(self, host_os: str) -> None:
         self.keyboard = KeyboardController()
         self.current: set[object] = set()
+        self.modifier_bits = pynput_modifier_bits(host_os)
+        self.modifier_keys = frozenset(self.modifier_bits.values())
         self.lock = threading.Lock()
 
     def apply(self, state: KeyState) -> None:
-        target_modifiers = state.modifier_objects
+        target_modifiers = state.modifier_objects(self.modifier_bits)
         target_keys = state.key_objects
         target = target_modifiers | target_keys
         with self.lock:
-            current_modifiers = self.current & MODIFIER_KEYS
-            current_keys = self.current - MODIFIER_KEYS
+            current_modifiers = self.current & self.modifier_keys
+            current_keys = self.current - self.modifier_keys
 
             for key in current_keys - target_keys:
                 self.keyboard.release(key)
@@ -292,8 +350,8 @@ class KeyboardBridge:
 
     def release_all(self) -> None:
         with self.lock:
-            current_modifiers = self.current & MODIFIER_KEYS
-            current_keys = self.current - MODIFIER_KEYS
+            current_modifiers = self.current & self.modifier_keys
+            current_keys = self.current - self.modifier_keys
             for key in list(current_keys):
                 self.keyboard.release(key)
             for key in list(current_modifiers):
@@ -340,8 +398,8 @@ class MouseBridge:
 
 
 class InputBridge:
-    def __init__(self, mouse_mode_active: threading.Event) -> None:
-        self.keyboard = KeyboardBridge()
+    def __init__(self, mouse_mode_active: threading.Event, host_os: str) -> None:
+        self.keyboard = KeyboardBridge(host_os)
         self.mouse = MouseBridge(mouse_mode_active)
 
     def apply(self, state: KeyState | MouseState) -> None:
@@ -661,8 +719,88 @@ def make_server_args(**overrides: object) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
+def discovery_probe_packet(args: argparse.Namespace) -> bytes:
+    return (
+        f"{DISCOVERY_MAGIC} DISCOVER {DISCOVERY_VERSION} {args.width} {args.height}\n"
+    ).encode("ascii")
+
+
+def discovery_host_packet(args: argparse.Namespace) -> bytes:
+    return (
+        f"{DISCOVERY_MAGIC} HOST {DISCOVERY_VERSION} {args.width} {args.height} "
+        f"{args.frame_port} {args.input_port}\n"
+    ).encode("ascii")
+
+
+def discovery_server(args: argparse.Namespace, stop: threading.Event) -> None:
+    probe = discovery_probe_packet(args)
+    host_packet = discovery_host_packet(args)
+    seen: dict[str, float] = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass
+        try:
+            server.bind(("0.0.0.0", DISCOVERY_PORT))
+        except OSError as exc:
+            print(f"DISCOVERY: disabled ({exc})", flush=True)
+            return
+        server.settimeout(0.5)
+        print(f"DISCOVERY: listening on UDP {DISCOVERY_PORT}", flush=True)
+        next_broadcast = 0.0
+        while not stop.is_set():
+            now = time.monotonic()
+            if now >= next_broadcast:
+                try:
+                    server.sendto(probe, ("255.255.255.255", DISCOVERY_PORT))
+                except OSError as exc:
+                    print(f"DISCOVERY: broadcast failed ({exc})", flush=True)
+                next_broadcast = now + DISCOVERY_BROADCAST_INTERVAL
+
+            try:
+                data, addr = server.recvfrom(256)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if not stop.is_set():
+                    print(f"DISCOVERY: socket error ({exc})", flush=True)
+                break
+
+            text = data.decode("ascii", errors="replace").strip()
+            parts = text.split()
+            if len(parts) < 5 or parts[0] != DISCOVERY_MAGIC:
+                continue
+            if parts[1] != "ADV":
+                continue
+            try:
+                version = int(parts[2])
+                width = int(parts[3])
+                height = int(parts[4])
+            except ValueError:
+                continue
+            if version != DISCOVERY_VERSION:
+                continue
+            if width != args.width or height != args.height:
+                print(
+                    f"DISCOVERY: {addr[0]}:{addr[1]} announced {width}x{height}, expected {args.width}x{args.height}",
+                    flush=True,
+                )
+                continue
+
+            if now - seen.get(addr[0], 0.0) >= 10.0:
+                print(f"DISCOVERY: ADV {addr[0]}:{addr[1]}", flush=True)
+                seen[addr[0]] = now
+
+            try:
+                server.sendto(host_packet, addr)
+            except OSError as exc:
+                print(f"DISCOVERY: reply to {addr[0]} failed ({exc})", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve Windows screen and keyboard control to a Cardputer-Adv.")
+    parser = argparse.ArgumentParser(description="Serve desktop screen and keyboard control to a Cardputer-Adv.")
     parser.add_argument("--bind", default=DEFAULT_CONFIG["bind"], help="IP/interface to listen on.")
     parser.add_argument("--frame-port", type=int, default=DEFAULT_CONFIG["frame_port"])
     parser.add_argument("--input-port", type=int, default=DEFAULT_CONFIG["input_port"])
@@ -672,10 +810,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--monitor", type=int, default=DEFAULT_CONFIG["monitor"], help="mss monitor index. 1 is usually the primary display.")
     parser.add_argument("--quality-filter", choices=QUALITY_FILTER_CHOICES, default=DEFAULT_CONFIG["quality_filter"])
     parser.add_argument("--input-timeout", type=float, default=DEFAULT_CONFIG["input_timeout"], help="Seconds without input reports before reconnect.")
-    parser.add_argument("--input-backend", choices=INPUT_BACKEND_CHOICES, default=DEFAULT_CONFIG["input_backend"])
+    parser.add_argument("--host-os", choices=HOST_OS_CHOICES, default=DEFAULT_CONFIG["host_os"], help="Host key mapping for the bridge. On Windows, Cardputer Opt maps to Win; on macOS, it maps to Option.")
+    parser.add_argument("--input-backend", choices=available_input_backends(), default=DEFAULT_CONFIG["input_backend"])
     parser.add_argument("--mouse-pump-hz", type=float, default=DEFAULT_CONFIG["mouse_pump_hz"], help="Hidden-crosshair mouse pump rate for game mode.")
     parser.add_argument("--mouse-hold-ms", type=float, default=DEFAULT_CONFIG["mouse_hold_ms"], help="How long each game mouse delta is replayed.")
     parser.add_argument("--mouse-scale", type=float, default=DEFAULT_CONFIG["mouse_scale"], help="Multiplier for game mouse deltas.")
+    parser.add_argument("--keyframe-interval", type=float, default=DEFAULT_CONFIG["keyframe_interval"], help="Seconds between full RGB565 keyframes. Use 0 to send only the initial keyframe.")
     parser.add_argument("--no-admin-relaunch", action="store_true", help="Do not relaunch through UAC on Windows.")
     return parser.parse_args()
 
@@ -763,6 +903,14 @@ def accept_client(
 
 def rgb_to_rgb565_bytes(image: Image.Image) -> bytes:
     rgb = image.convert("RGB")
+    if np is not None:
+        pixels = np.asarray(rgb, dtype=np.uint8)
+        red = pixels[:, :, 0].astype(np.uint16)
+        green = pixels[:, :, 1].astype(np.uint16)
+        blue = pixels[:, :, 2].astype(np.uint16)
+        rgb565 = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3)
+        return rgb565.astype("<u2", copy=False).tobytes()
+
     out = bytearray(rgb.width * rgb.height * 2)
     offset = 0
     for r, g, b in rgb.getdata():
@@ -771,6 +919,42 @@ def rgb_to_rgb565_bytes(image: Image.Image) -> bytes:
         out[offset + 1] = value >> 8
         offset += 2
     return bytes(out)
+
+
+def encode_tile_delta_frame(frame: bytes, previous: bytes, width: int, height: int) -> FramePacket:
+    parts: list[bytes] = [TILE_DELTA_HEADER.pack(0, 0)]
+    tile_count = 0
+    stride = width * 2
+
+    for y in range(0, height, TILE_HEIGHT):
+        tile_h = min(TILE_HEIGHT, height - y)
+        for x in range(0, width, TILE_WIDTH):
+            tile_w = min(TILE_WIDTH, width - x)
+            row_len = tile_w * 2
+            row_parts: list[bytes] = []
+            changed = False
+            for row in range(y, y + tile_h):
+                start = row * stride + x * 2
+                end = start + row_len
+                row_data = frame[start:end]
+                if row_data != previous[start:end]:
+                    changed = True
+                row_parts.append(row_data)
+            if not changed:
+                continue
+
+            tile_count += 1
+            parts.append(TILE_HEADER.pack(x, y, tile_w, tile_h))
+            parts.extend(row_parts)
+
+    if tile_count == 0:
+        return FramePacket(FORMAT_TILE_DELTA, TILE_DELTA_HEADER.pack(0, 0), tile_count)
+
+    parts[0] = TILE_DELTA_HEADER.pack(tile_count, 0)
+    payload = b"".join(parts)
+    if len(payload) >= len(frame):
+        return FramePacket(FORMAT_RGB565, frame, tile_count)
+    return FramePacket(FORMAT_TILE_DELTA, payload, tile_count)
 
 
 def draw_cursor_crosshair(
@@ -817,11 +1001,14 @@ def capture_frames(
     resize_filter: int,
     mouse: MouseController,
     mouse_mode_active: threading.Event,
-) -> Iterable[bytes]:
+    keyframe_interval: float,
+) -> Iterable[FramePacket]:
     with mss() as screen:
         if monitor_index < 0 or monitor_index >= len(screen.monitors):
             raise SystemExit(f"Monitor {monitor_index} does not exist. Available: 0..{len(screen.monitors) - 1}")
         monitor = screen.monitors[monitor_index]
+        previous_frame: bytes | None = None
+        last_keyframe_at = 0.0
         while True:
             shot = screen.grab(monitor)
             image = Image.frombytes("RGB", shot.size, shot.rgb)
@@ -833,7 +1020,20 @@ def capture_frames(
             canvas.paste(image, (x, y))
             if mouse_mode_active.is_set():
                 draw_cursor_crosshair(canvas, monitor, x, y, image.width, image.height, mouse)
-            yield rgb_to_rgb565_bytes(canvas)
+            frame = rgb_to_rgb565_bytes(canvas)
+            now = time.perf_counter()
+            force_keyframe = previous_frame is None or (
+                keyframe_interval > 0 and now - last_keyframe_at >= keyframe_interval
+            )
+            if force_keyframe:
+                packet = FramePacket(FORMAT_RGB565, frame)
+                last_keyframe_at = now
+            else:
+                packet = encode_tile_delta_frame(frame, previous_frame, width, height)
+                if packet.format == FORMAT_RGB565:
+                    last_keyframe_at = now
+            previous_frame = frame
+            yield packet
 
 
 def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_active: threading.Event) -> None:
@@ -855,7 +1055,15 @@ def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_act
             if conn is None:
                 break
             try:
-                for payload in capture_frames(args.width, args.height, args.monitor, resize_filter, mouse, mouse_mode_active):
+                for packet in capture_frames(
+                    args.width,
+                    args.height,
+                    args.monitor,
+                    resize_filter,
+                    mouse,
+                    mouse_mode_active,
+                    args.keyframe_interval,
+                ):
                     if stop.is_set():
                         break
                     frame_id = (frame_id + 1) & 0xFFFFFFFF
@@ -864,12 +1072,12 @@ def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_act
                         FRAME_VERSION,
                         args.width,
                         args.height,
-                        FORMAT_RGB565,
+                        packet.format,
                         frame_id,
-                        len(payload),
+                        len(packet.payload),
                     )
                     started = time.perf_counter()
-                    conn.sendall(header + payload)
+                    conn.sendall(header + packet.payload)
                     elapsed = time.perf_counter() - started
                     time.sleep(max(0.0, interval - elapsed))
             except (ConnectionError, OSError) as exc:
@@ -941,7 +1149,7 @@ def input_server(args: argparse.Namespace, bridge: InputBridge | Win32InputBridg
 def create_input_bridge(args: argparse.Namespace, mouse_mode_active: threading.Event) -> InputBridge | Win32InputBridge:
     if args.input_backend == "win32":
         return Win32InputBridge(mouse_mode_active, args)
-    return InputBridge(mouse_mode_active)
+    return InputBridge(mouse_mode_active, args.host_os)
 
 
 def run_server(args: argparse.Namespace, stop: threading.Event | None = None) -> None:
@@ -950,16 +1158,24 @@ def run_server(args: argparse.Namespace, stop: threading.Event | None = None) ->
     mouse_mode_active = threading.Event()
     bridge = create_input_bridge(args, mouse_mode_active)
 
-    print("Cardputer-Adv Windows Remote server")
+    print("Cardputer-Adv Remote desktop server")
     print(f"Resolution: {args.width}x{args.height} at {args.fps:g} FPS")
     print(f"Monitor: {args.monitor}")
     print(f"Quality filter: {args.quality_filter}")
+    print(f"Frame codec: RGB565 keyframes + {TILE_WIDTH}x{TILE_HEIGHT} tile delta")
+    print(f"Keyframe interval: {args.keyframe_interval:g}s")
+    print(f"Host key mapping: {args.host_os}")
     print(f"Input backend: {args.input_backend}")
     print(f"Game mouse: {args.mouse_pump_hz:g} Hz, hold {args.mouse_hold_ms:g} ms, scale {args.mouse_scale:g}")
+    print(f"Discovery: UDP {DISCOVERY_PORT}")
     print(f"Administrator: {'yes' if is_admin() else 'no'}")
-    print("Tip: run as Administrator if you need to control elevated windows.")
+    if os.name == "nt":
+        print("Tip: run as Administrator if you need to control elevated windows.")
+    elif sys.platform == "darwin":
+        print("Tip: grant Screen Recording and Accessibility permissions to control macOS.")
 
     threads = [
+        threading.Thread(target=discovery_server, args=(args, stop), daemon=True),
         threading.Thread(target=frame_server, args=(args, stop, mouse_mode_active), daemon=True),
         threading.Thread(target=input_server, args=(args, bridge, stop), daemon=True),
     ]
