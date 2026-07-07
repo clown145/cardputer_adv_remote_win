@@ -24,11 +24,13 @@ from windows_remote_server import (
     HOST_OS_CHOICES,
     QUALITY_FILTER_CHOICES,
     available_input_backends,
+    create_pynput_runtime,
     ensure_admin,
     default_host_os,
     default_input_backend,
     is_admin,
     make_server_args,
+    PynputRuntime,
     run_server,
 )
 
@@ -510,8 +512,25 @@ class RemoteGui(tk.Tk):
 
         self.stop_event = threading.Event()
         args = make_server_args(**values)
+        pynput_runtime: PynputRuntime | None = None
+        if is_macos() and args.input_backend == "pynput":
+            try:
+                pynput_runtime = create_pynput_runtime(args.host_os)
+            except Exception as exc:
+                messagebox.showerror(
+                    "macOS input",
+                    "Could not initialize macOS input control.\n\n"
+                    "Grant Accessibility permission to the app, then reopen it.\n\n"
+                    f"{exc}",
+                    parent=self,
+                )
+                return
         self._append_log(f"Settings saved to {settings_path()}\n")
-        self.server_thread = threading.Thread(target=self._server_main, args=(args, self.stop_event), daemon=True)
+        self.server_thread = threading.Thread(
+            target=self._server_main,
+            args=(args, self.stop_event, pynput_runtime),
+            daemon=True,
+        )
         self.server_thread.start()
         self._set_running(True)
 
@@ -520,11 +539,16 @@ class RemoteGui(tk.Tk):
             self.stop_event.set()
         self.status_var.set("Stopping")
 
-    def _server_main(self, args: argparse.Namespace, stop_event: threading.Event) -> None:
+    def _server_main(
+        self,
+        args: argparse.Namespace,
+        stop_event: threading.Event,
+        pynput_runtime: PynputRuntime | None,
+    ) -> None:
         writer = QueueWriter(self.log_queue)
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                run_server(args, stop_event)
+                run_server(args, stop_event, pynput_runtime=pynput_runtime)
         except Exception as exc:
             self.log_queue.put(("log", f"\nERROR: {exc}\n"))
         finally:
@@ -622,7 +646,8 @@ class RemoteGui(tk.Tk):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Open the Cardputer-Adv Remote desktop control panel.")
     parser.add_argument("--no-admin-relaunch", action="store_true", help="Do not relaunch through UAC on Windows.")
-    return parser.parse_args()
+    argv = [arg for arg in sys.argv[1:] if not (is_macos() and arg.startswith("-psn_"))]
+    return parser.parse_args(argv)
 
 
 def main() -> None:

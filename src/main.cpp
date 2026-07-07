@@ -192,7 +192,7 @@ struct KeySnapshot {
     uint8_t physicalCharCount = 0;
 
     bool hasAction() const {
-        return enter || backspace || esc || up || left || down || right || charCount > 0;
+        return enter || backspace || esc || up || left || down || right || charCount > 0 || physicalCharCount > 0;
     }
 
     bool hasChar(char target) const {
@@ -213,6 +213,15 @@ struct KeySnapshot {
             }
         }
         return false;
+    }
+
+    void addPhysicalChar(char c) {
+        if (physicalCharCount >= sizeof(physicalChars)) {
+            return;
+        }
+        if (c >= 32 && c <= 126) {
+            physicalChars[physicalCharCount++] = c;
+        }
     }
 };
 
@@ -258,10 +267,9 @@ KeySnapshot waitKeyPress() {
                 if (key.physicalCharCount >= sizeof(key.physicalChars)) {
                     break;
                 }
-                const char c = M5Cardputer.Keyboard.getKeyValue(pos).value_first;
-                if (c >= 32 && c <= 126) {
-                    key.physicalChars[key.physicalCharCount++] = c;
-                }
+                const KeyValue_t keyValue = M5Cardputer.Keyboard.getKeyValue(pos);
+                key.addPhysicalChar(keyValue.value_first);
+                key.addPhysicalChar(keyValue.value_second);
             }
             if (key.hasAction()) {
                 return key;
@@ -1170,14 +1178,35 @@ bool sendMouseReport(int8_t dx, int8_t dy, int8_t wheel, uint8_t buttons, bool a
     return false;
 }
 
+bool keyCharMatches(char current, char normal, char shifted) {
+    if (current == normal || current == shifted) {
+        return true;
+    }
+    if (current >= 32 && current <= 126) {
+        const char normalized = static_cast<char>(tolower(static_cast<unsigned char>(current)));
+        const char normalizedNormal = static_cast<char>(tolower(static_cast<unsigned char>(normal)));
+        const char normalizedShifted = static_cast<char>(tolower(static_cast<unsigned char>(shifted)));
+        return normalized == normalizedNormal || normalized == normalizedShifted;
+    }
+    return false;
+}
+
 bool keyPressed(char normal, char shifted) {
-    for (const auto& pos : M5Cardputer.Keyboard.keyList()) {
-        const char c = M5Cardputer.Keyboard.getKeyValue(pos).value_first;
-        if (c == normal || c == shifted) {
+    auto& state = M5Cardputer.Keyboard.keysState();
+    for (const char c : state.word) {
+        if (keyCharMatches(c, normal, shifted)) {
             return true;
         }
     }
-    return false;
+    for (const auto& pos : M5Cardputer.Keyboard.keyList()) {
+        const KeyValue_t keyValue = M5Cardputer.Keyboard.getKeyValue(pos);
+        if (keyCharMatches(keyValue.value_first, normal, shifted) ||
+            keyCharMatches(keyValue.value_second, normal, shifted) ||
+            keyCharMatches(keyValue.value_third, normal, shifted)) {
+            return true;
+        }
+    }
+    return M5Cardputer.Keyboard.isKeyPressed(normal) || M5Cardputer.Keyboard.isKeyPressed(shifted);
 }
 
 void resetMouseRuntimeState() {

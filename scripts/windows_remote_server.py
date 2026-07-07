@@ -13,12 +13,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from PIL import Image, ImageDraw
 from mss import mss
-from pynput.keyboard import Controller as KeyboardController, Key
-from pynput.mouse import Button, Controller as MouseController
 
 try:
     import numpy as np
@@ -41,9 +39,9 @@ MOUSE_REPORT_FLAG = 0x80
 MOUSE_MODE_ACTIVE = 0x08
 MOUSE_HIDE_CROSSHAIR = 0x10
 MOUSE_BUTTONS = {
-    0: Button.left,
-    1: Button.right,
-    2: Button.middle,
+    0: "left",
+    1: "right",
+    2: "middle",
 }
 QUALITY_FILTER_CHOICES = ("nearest", "bilinear", "bicubic")
 INPUT_BACKEND_CHOICES = ("win32", "pynput")
@@ -55,6 +53,65 @@ DISCOVERY_MAGIC = "CARDPUTER_REMOTE"
 DISCOVERY_PORT = 5052
 DISCOVERY_VERSION = 1
 DISCOVERY_BROADCAST_INTERVAL = 2.0
+
+_KeyboardController: type[Any] | None = None
+_Key: Any | None = None
+_MouseController: type[Any] | None = None
+_Button: Any | None = None
+
+
+def ensure_pynput() -> tuple[type[Any], Any, type[Any], Any]:
+    global _KeyboardController, _Key, _MouseController, _Button
+    if _KeyboardController is None or _Key is None or _MouseController is None or _Button is None:
+        from pynput.keyboard import Controller as KeyboardController, Key
+        from pynput.mouse import Button, Controller as MouseController
+
+        _KeyboardController = KeyboardController
+        _Key = Key
+        _MouseController = MouseController
+        _Button = Button
+    return _KeyboardController, _Key, _MouseController, _Button
+
+
+def create_keyboard_controller() -> Any:
+    keyboard_controller, _, _, _ = ensure_pynput()
+    return keyboard_controller()
+
+
+def create_mouse_controller() -> Any:
+    _, _, mouse_controller, _ = ensure_pynput()
+    return mouse_controller()
+
+
+def resolve_pynput_key(value: object) -> Any:
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == "key":
+        _, key, _, _ = ensure_pynput()
+        return getattr(key, str(value[1]))
+    return value
+
+
+def resolve_pynput_mouse_buttons() -> dict[int, Any]:
+    _, _, _, button = ensure_pynput()
+    return {bit: getattr(button, name) for bit, name in MOUSE_BUTTONS.items()}
+
+
+@dataclass
+class PynputRuntime:
+    keyboard: Any
+    input_mouse: Any
+    cursor_mouse: Any
+    modifier_bits: dict[int, Any]
+    mouse_buttons: dict[int, Any]
+
+
+def create_pynput_runtime(host_os: str) -> PynputRuntime:
+    return PynputRuntime(
+        keyboard=create_keyboard_controller(),
+        input_mouse=create_mouse_controller(),
+        cursor_mouse=create_mouse_controller(),
+        modifier_bits=pynput_modifier_bits(host_os),
+        mouse_buttons=resolve_pynput_mouse_buttons(),
+    )
 
 
 def default_host_os() -> str:
@@ -215,11 +272,11 @@ HID_TO_PYNPUT = {
     0x25: "8",
     0x26: "9",
     0x27: "0",
-    0x28: Key.enter,
-    0x29: Key.esc,
-    0x2A: Key.backspace,
-    0x2B: Key.tab,
-    0x2C: Key.space,
+    0x28: ("key", "enter"),
+    0x29: ("key", "esc"),
+    0x2A: ("key", "backspace"),
+    0x2B: ("key", "tab"),
+    0x2C: ("key", "space"),
     0x2D: "-",
     0x2E: "=",
     0x2F: "[",
@@ -231,49 +288,48 @@ HID_TO_PYNPUT = {
     0x36: ",",
     0x37: ".",
     0x38: "/",
-    0x39: Key.caps_lock,
-    0x3A: Key.f1,
-    0x3B: Key.f2,
-    0x3C: Key.f3,
-    0x3D: Key.f4,
-    0x3E: Key.f5,
-    0x3F: Key.f6,
-    0x40: Key.f7,
-    0x41: Key.f8,
-    0x42: Key.f9,
-    0x43: Key.f10,
-    0x44: Key.f11,
-    0x45: Key.f12,
-    0x4C: Key.delete,
-    0x4F: Key.right,
-    0x50: Key.left,
-    0x51: Key.down,
-    0x52: Key.up,
+    0x39: ("key", "caps_lock"),
+    0x3A: ("key", "f1"),
+    0x3B: ("key", "f2"),
+    0x3C: ("key", "f3"),
+    0x3D: ("key", "f4"),
+    0x3E: ("key", "f5"),
+    0x3F: ("key", "f6"),
+    0x40: ("key", "f7"),
+    0x41: ("key", "f8"),
+    0x42: ("key", "f9"),
+    0x43: ("key", "f10"),
+    0x44: ("key", "f11"),
+    0x45: ("key", "f12"),
+    0x4C: ("key", "delete"),
+    0x4F: ("key", "right"),
+    0x50: ("key", "left"),
+    0x51: ("key", "down"),
+    0x52: ("key", "up"),
 }
 
 MODIFIER_BITS = {
-    0: Key.ctrl_l,
-    1: Key.shift_l,
-    2: Key.alt_l,
-    3: Key.cmd_l,
-    4: Key.ctrl_r,
-    5: Key.shift_r,
-    6: Key.alt_r,
-    7: Key.cmd_r,
+    0: ("key", "ctrl_l"),
+    1: ("key", "shift_l"),
+    2: ("key", "alt_l"),
+    3: ("key", "cmd_l"),
+    4: ("key", "ctrl_r"),
+    5: ("key", "shift_r"),
+    6: ("key", "alt_r"),
+    7: ("key", "cmd_r"),
 }
 MODIFIER_KEYS = frozenset(MODIFIER_BITS.values())
 
 MACOS_MODIFIER_BITS = {
     **MODIFIER_BITS,
-    3: Key.alt_l,
-    7: Key.alt_r,
+    3: ("key", "alt_l"),
+    7: ("key", "alt_r"),
 }
 
 
 def pynput_modifier_bits(host_os: str) -> dict[int, object]:
-    if host_os == HOST_OS_MACOS:
-        return MACOS_MODIFIER_BITS
-    return MODIFIER_BITS
+    bits = MACOS_MODIFIER_BITS if host_os == HOST_OS_MACOS else MODIFIER_BITS
+    return {bit: resolve_pynput_key(key) for bit, key in bits.items()}
 
 @dataclass(frozen=True)
 class KeyState:
@@ -291,7 +347,7 @@ class KeyState:
     def key_objects(self) -> set[object]:
         pressed: set[object] = set()
         for hid in self.keys:
-            key = HID_TO_PYNPUT.get(hid)
+            key = resolve_pynput_key(HID_TO_PYNPUT.get(hid))
             if key is not None:
                 pressed.add(key)
         return pressed
@@ -307,9 +363,10 @@ class MouseState:
     wheel: int
 
     @property
-    def button_objects(self) -> set[Button]:
-        pressed: set[Button] = set()
-        for bit, button in MOUSE_BUTTONS.items():
+    def button_objects(self) -> set[Any]:
+        buttons = resolve_pynput_mouse_buttons()
+        pressed: set[Any] = set()
+        for bit, button in buttons.items():
             if self.buttons & (1 << bit):
                 pressed.add(button)
         return pressed
@@ -323,10 +380,10 @@ class FramePacket:
 
 
 class KeyboardBridge:
-    def __init__(self, host_os: str) -> None:
-        self.keyboard = KeyboardController()
+    def __init__(self, host_os: str, controller: Any | None = None, modifier_bits: dict[int, Any] | None = None) -> None:
+        self.keyboard = controller if controller is not None else create_keyboard_controller()
         self.current: set[object] = set()
-        self.modifier_bits = pynput_modifier_bits(host_os)
+        self.modifier_bits = modifier_bits if modifier_bits is not None else pynput_modifier_bits(host_os)
         self.modifier_keys = frozenset(self.modifier_bits.values())
         self.lock = threading.Lock()
 
@@ -360,10 +417,16 @@ class KeyboardBridge:
 
 
 class MouseBridge:
-    def __init__(self, mode_active: threading.Event) -> None:
-        self.mouse = MouseController()
+    def __init__(
+        self,
+        mode_active: threading.Event,
+        controller: Any | None = None,
+        buttons: dict[int, Any] | None = None,
+    ) -> None:
+        self.mouse = controller if controller is not None else create_mouse_controller()
         self.mode_active = mode_active
-        self.current_buttons: set[Button] = set()
+        self.mouse_buttons = buttons if buttons is not None else resolve_pynput_mouse_buttons()
+        self.current_buttons: set[Any] = set()
         self.lock = threading.Lock()
 
     def apply(self, state: MouseState) -> None:
@@ -376,7 +439,7 @@ class MouseBridge:
             self.mode_active.set()
         else:
             self.mode_active.clear()
-        target_buttons = state.button_objects
+        target_buttons = {button for bit, button in self.mouse_buttons.items() if state.buttons & (1 << bit)}
         with self.lock:
             for button in self.current_buttons - target_buttons:
                 self.mouse.release(button)
@@ -398,9 +461,16 @@ class MouseBridge:
 
 
 class InputBridge:
-    def __init__(self, mouse_mode_active: threading.Event, host_os: str) -> None:
-        self.keyboard = KeyboardBridge(host_os)
-        self.mouse = MouseBridge(mouse_mode_active)
+    def __init__(
+        self,
+        mouse_mode_active: threading.Event,
+        host_os: str,
+        runtime: PynputRuntime | None = None,
+    ) -> None:
+        if runtime is None:
+            runtime = create_pynput_runtime(host_os)
+        self.keyboard = KeyboardBridge(host_os, runtime.keyboard, runtime.modifier_bits)
+        self.mouse = MouseBridge(mouse_mode_active, runtime.input_mouse, runtime.mouse_buttons)
 
     def apply(self, state: KeyState | MouseState) -> None:
         if isinstance(state, KeyState):
@@ -964,7 +1034,7 @@ def draw_cursor_crosshair(
     image_y: int,
     image_w: int,
     image_h: int,
-    mouse: MouseController,
+    mouse: Any,
 ) -> None:
     cursor_x, cursor_y = mouse.position
     monitor_left = monitor["left"]
@@ -999,7 +1069,7 @@ def capture_frames(
     height: int,
     monitor_index: int,
     resize_filter: int,
-    mouse: MouseController,
+    mouse: Any,
     mouse_mode_active: threading.Event,
     keyframe_interval: float,
 ) -> Iterable[FramePacket]:
@@ -1036,7 +1106,12 @@ def capture_frames(
             yield packet
 
 
-def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_active: threading.Event) -> None:
+def frame_server(
+    args: argparse.Namespace,
+    stop: threading.Event,
+    mouse_mode_active: threading.Event,
+    cursor_mouse: Any | None = None,
+) -> None:
     resize_filter = {
         "nearest": Image.Resampling.NEAREST,
         "bilinear": Image.Resampling.BILINEAR,
@@ -1049,7 +1124,7 @@ def frame_server(args: argparse.Namespace, stop: threading.Event, mouse_mode_act
         print(f"FRAME: listening on {args.bind}:{args.frame_port}", flush=True)
         frame_id = 0
         interval = 1.0 / max(args.fps, 0.1)
-        mouse = MouseController()
+        mouse = cursor_mouse if cursor_mouse is not None else create_mouse_controller()
         while not stop.is_set():
             conn = accept_client(server, "FRAME", args.width, args.height, stop)
             if conn is None:
@@ -1146,17 +1221,28 @@ def input_server(args: argparse.Namespace, bridge: InputBridge | Win32InputBridg
                 conn.close()
 
 
-def create_input_bridge(args: argparse.Namespace, mouse_mode_active: threading.Event) -> InputBridge | Win32InputBridge:
+def create_input_bridge(
+    args: argparse.Namespace,
+    mouse_mode_active: threading.Event,
+    pynput_runtime: PynputRuntime | None = None,
+) -> InputBridge | Win32InputBridge:
     if args.input_backend == "win32":
         return Win32InputBridge(mouse_mode_active, args)
-    return InputBridge(mouse_mode_active, args.host_os)
+    return InputBridge(mouse_mode_active, args.host_os, pynput_runtime)
 
 
-def run_server(args: argparse.Namespace, stop: threading.Event | None = None) -> None:
+def run_server(
+    args: argparse.Namespace,
+    stop: threading.Event | None = None,
+    pynput_runtime: PynputRuntime | None = None,
+) -> None:
     if stop is None:
         stop = threading.Event()
     mouse_mode_active = threading.Event()
-    bridge = create_input_bridge(args, mouse_mode_active)
+    if args.input_backend == "pynput" and pynput_runtime is None:
+        pynput_runtime = create_pynput_runtime(args.host_os)
+    bridge = create_input_bridge(args, mouse_mode_active, pynput_runtime)
+    cursor_mouse = pynput_runtime.cursor_mouse if pynput_runtime is not None else None
 
     print("Cardputer-Adv Remote desktop server")
     print(f"Resolution: {args.width}x{args.height} at {args.fps:g} FPS")
@@ -1176,7 +1262,7 @@ def run_server(args: argparse.Namespace, stop: threading.Event | None = None) ->
 
     threads = [
         threading.Thread(target=discovery_server, args=(args, stop), daemon=True),
-        threading.Thread(target=frame_server, args=(args, stop, mouse_mode_active), daemon=True),
+        threading.Thread(target=frame_server, args=(args, stop, mouse_mode_active, cursor_mouse), daemon=True),
         threading.Thread(target=input_server, args=(args, bridge, stop), daemon=True),
     ]
     for thread in threads:
